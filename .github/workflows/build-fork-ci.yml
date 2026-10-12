@@ -45,11 +45,11 @@ jobs:
       run: pip install --upgrade intelhex
 
     - name: Install RAK Deps
-      run: pio pkg install --platform nordicnrf52
+      run: pio pkg install --global --platform nordicnrf52
 
     - name: Install ESP32 platform
-      run: pio pkg install --platform espressif32
-      
+      run: pio pkg install --global --platform espressif32
+
     - name: Add T-Beam Supreme board definition
       run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
 

@@ -125,155 +125,60 @@ This README is subject to change and serves as the definitive terms of use for t
 ---
 ---
 
-## Current as of October 10, 2026 :
+## 📑 Condensed Project Overview (As of October 2026)
 
 # MeshCom
-MeshCom is indeed an exciting project of the Institute of Citizen Science for Space & Wireless communication (www.icssw.org)  aimed at creating a resilient, text-based communication tool for amateur radio operators. It utilizes LORA™ modulation technology and the APRS protocol to establish a mesh network in the 70cm band. The main objectives of MeshCom are to realize a connected off-grid messaging system with low energy consumption and cost-effective hardware. The technical implementation is based on LORA™  radio modules, which can transmit messages, positions, measurements, and more over long distances with low transmit power. MeshCom modules can be connected to form a mesh network or establish a messaging network via MeshCom gateways, ideally connected through HAMNET.
+MeshCom is an exciting project of the Institute of Citizen Science for Space & Wireless communication (www.icssw.org) aimed at creating a resilient, text-based communication tool for amateur radio operators.
+It utilizes LORA™ modulation technology and the APRS protocol to establish a mesh network in the 70cm band.
 
 ## Basic functions:
--	Each Node is identified by a Amateur Radio Callsign (with optional SSID)
--	Short test messages can be sent to ALL (everybody), with ACK from Server/Gateway
--	Short text messages can be sent DIRECTLY to other Callsign, with End-toEnd Aknowledgement
--	Some Nodes can als be to configured to act as GATEWAY to HAMNET or INTERNET (wifi)
--	Each Node should act as a repeater for all other MESHCOM messages on air
--	Servers and Gateways might have some functionalities to avoid the transmission of redundant trafic
--	Nodes will automatically send STATUS and POSITION messages
--	NODES with optional Sensors will send WX-Data or TELEMETRY Data periodically
--	Messages will be diplayed on small OLED Display or via BT connected smartphone or tablet device or via USB connected serial console
+- Each Node is identified by an Amateur Radio Callsign (with optional SSID)
+- Short test messages can be sent to ALL (everybody), with ACK from Server/Gateway
+- Short text messages can be sent DIRECTLY to other callsigns, with End-to-End Acknowledgment
+- Nodes automatically send STATUS, POSITION, and WX/TELEMETRY data periodically
+- Messages will be displayed on small OLED Display, via Bluetooth apps, or Serial Console
 
-The main goal is to have a selfbuilding and selfhealing Mesh-Network, that can be enhanced by other components of the Amateur Radio Service, like HAMNET (IP-Network), centralised or distributed Meshcom servers. This will increase coverage to all continents and enable interconnection to other modes and services (APRS, WINLINK, DMR, TETRA-SDS, SOTA-WATCH, POCSAG,VARA-AC, …) building an unified communication plattform.
-Particulary useful is Meshcom for Emergency Communication (EMCOM) in case of disaster or Blackout.
-In all usecases terms  and rules of Amateur Radio Service (strictly non commercial, experimental) should be respected.
-This is an open Citizen Science project that should help to promote Amateur Radio Service within academic and society.<br/><br/>
-For more information visit: https://icssw.org/en/meshcom/
+## Frequency in Region:
+EU / USA / Africa: 433.175 MHz | UK: 439.9125 MHz (BW:125k SF:10) | Norway: 433.925 MHz (BW:125k SF:10)
 
-## Frequency in Region: 
-EU: 433.175<br/>
-UK: 439.9125 BW:125k SF:10<br/>
-Norwegen: 433.925 BW:125k SF:10<br/>
-USA: 433.175<br/>
-Afrika: 433.175<br/>
-Asia/Pacific: tbd<br/>
+## LoRa parameters:
+SF: 11 | Bandwidth: 250kHz | CR: 4/6
 
-## Lora parameter:
-SF: 11
-Bandwith: 250kHz
-CR: 4/6
+## MeshCom 4.0 Firmware & Protocol
+MeshCom 4.0 uses the APRS PROTOCOL REFERENCE for the source, destination, Digipeater, and payload data as defined for AX.25 APRS packets.
 
-## APRS-Protokoll: 
-Document: http://www.aprs.org/doc/APRS101.PDF
-Address: Call-SSID, Source, Target, DIGI1-5
-Telemetry: data, formula, units,…
-Weather: Temp, pressure, rain,…
-Aim is to be fully compatible to aprs.fi
-
-## Hardware:
-ESP32/LoRa-Modul, RAK-WISBLOCK, ESP32-DEV4/E22-LoRa, ...
-
-# MeshCom 4.0 Firmware
-MeshCom is a project to exchange text messages via LORA radio modules. The primary goal is to realize networked off-grid messaging with low power and low cost hardware.
-
-The technical approach is based on the use of LORA radio modules which transmit messages, positions, measured values, telecontrol and much more with low transmission power over long distances. MeshCom modules can be combined to form a mesh network, but can also be connected to a message network via MeshCom gateways, which are ideally connected via HAMNET. This enables MeshCom radio networks, which are not connected to each other via radio, to communicate with each other.
-
-## MeshCom Protocol
-MeshCom 4.0 uses the APRS PROTOCOL REFERENCE for the source, destination, Digipeater and payload data as defined for APRS. (aprs101.pdf APRS PROTOCOL REFERENCE Version 1.0 2000, Page 12)
-MeshCom 4.0 verwendet für die Payload-Daten das AX.25 Protokoll, wie es für APRS definiert ist. (aprs101.pdf APRS PROTOCOL REFERENCE Version 1.0 2000, Seite 12)
-
-### Terms:
-- Identifier — APRS data type identifier
-- Message ID – 32-bit LSB->MSB unique value
-- MAX-HOP – max. 7 (mask 0x07) default 5 is used which allows another 4 transfers.
-  - 0x80 – ID as to whether this message has already been sent via the MQTT server
-  - 0x40 – Identification that this message should be supplemented for each MeshClient with the call sign of the transmitting station. For measurement and control purposes.
-- Source Address — This field contains the callsign and SSID of the transmitting station
-- Destination Address — This field can contain an APRS destination call sign or
-  - “*” for transmissions to ALL.
-- Digipeater — There can be 0 to 8 digipeater callsigns in this field. Note: These digipeater addresses can be overwritten by a generic APRS digipeater path (specified by the SSID of the destination address).
-- Payload – This field contains transport data. The first character of this field is the APRS data type identifier, which indicates what type of payload data follows.
-- Hardware ID - see table below
-- LoRa-Modulation INDEX - see table below
-- Frame Check Sequence – The FCS is a sequence of 16 bits used to check the integrity of a received frame.
-
-### Messages:
-- Text messages:
-   - :|!MMMMMMMM|!HH|OE0XXX-99|>*|:|Text message|!00|!HW|!MOD|FCS#
-- Text messages with Path from Mesh:
-    - :|!MMMMMMMM|!HH|OE0XXX-99,OE3XXX-12,OE3YYY-12|>*|:|Text message|!00|!HW|!MOD|FCS#
-- Position reports:
-    - !|!MMMMMMMM|!HH|OE0XXX-99|>*|!|4800.00|N|/|01600.00|E|#| BBB /A=HHHH|!00|!HW|!MOD|FCS#
-- Legend:
-   - | ... only serves to show the separations here in the text
-
-#### Message elements
-- Medlution ID: ! @ ... text, position, weather message
-- MMMMMMMM Message ID 32-bit LSB->MSB
-- HH MAX-HOP 8-bit bit mask 0x07
-- Message via MQTT server bit mask 0x80
-- Insert path into mesh (with comma as separation) bit mask 0x40
-- 4800.00 latitude degrees/decimal x 100
-- 01600.00 Longidude degrees/decimal x 100
-- N north / south char
-- / APRS SYMBOL group (/ or \) char
-- E E ast / West char
-- \# APRS SYMBOL char
-- BBB battery status in % int 0 - 100
-- /A=HHHH GPS sea level (m) int 0 - 9999
-- Message completion closes the APRS message range from 0x00
-- HW ... Hardware Type ID
-- MOD ... LoRa modulation ID
-- FCS# checksum including identifier and 0x00 from message completion unsigned int 16-bit
-- Extra information to form MHEARD
-  - GGGGGGGG Gateway ID (only for MeshCom 2.0 compatibility) 32-bit LSB->MSB
-  - HW hardware ID 8-bit (see table)
-
-### MeshCom hardware ID
-
-- Hardware ID HW type MCU type LoRa type HW short name HW version
-- 1 TTGO ESP32 Paxcounter ESP32 SX1278 TLORA V2
-- 2 TTGO ESP32 Paxcounter ESP32 SX1278 TLORA V1
-- 3 TTGO ESP32 Paxcounter ESP32 SX1278 TLORA V2 1.6
-- 4 TTGO T-Beam ESP32 SX1278 T-BEAM 1.1
-- 5 TTGO T-Beam ESP32 SX1268 T-BEAM-1268 1.1 1268
-- 6 TTGO T-Beam ESP32 SX1262 T-BEAM-0.7 0.7
-- 7 T-Echo LoRa SX1262 nRF SX1262 T-ECHO
-- 8 T-Deck ESP32-S3 SX1262 T-DECK
-- 9 Wisblock RAK4631 nRF52840
-- 10 WiFi LoRa 32 v2 ESP32 SX1262 HELTEC-V2-1 V2
-- 11 WiFi LoRa 32 v1 ESP32 SX1276 HELTEC-V1 V1
-- 12 TTGO T-Beam ESP32 SX1278 TBEAM-AXP2101
-- 39 Ebyte Lora E22 ESP32 SX1268 EBYTE-E22
-- 41 Heltec Tracker
-- 42 Heltec Stick v3
-- 43 WiFi LoRa 32 v3 ESP32-S3 SX1262 HELTEC-V3 V3
-- 44 Heltec E290
-- 45 TTGO T-Beam ESP32 SX1268 T-BEAM-1268 1.2 SX1262
-- 46 T-DECK-PLUS
-- 47 TBEAM SUPREME L76K GPS
-- 48 Ebyte Lora E22 ESP32-S3
-- 49 T-Lora Pager
-- 50 T-Deck Pro
-- 51 LilyGo T-Beam 1W
-- 52 Heltec Wifi Lora 32 v4 
-- 53 Lilygo T-ETH-ELite
-- 54 Heltec T114
-- 55 Lilygo T3 S3 V1.3
-- 56 Lilygo T-Connect Pro
-- 57 Heltec Wireless Paper
-
+---
 
 ## Preparations for platform.io VSCode plugin
-- Install the needed frameworks under Platforms: 
-  + Espressif 32
-  + Nordic nRF52
+Install the needed frameworks under Platforms: 
++ Espressif 32
++ Nordic nRF52
+
+---
 
 ## Flashing Firmware
-Usually it is done via the upload button in VSCode directly. 
-### ESP32 Via Command Line:
-- For this task the esptool is needed. You can either use the one from platform.io which is located at the `.platformio/tool-esptoolpy/esptool.py` in addition with the python venv, which is at: `.platformio/penv/bin/python`. The hidden `.platformio` directory is located in your User-Directory.<br/>
-Otherwise if not already installed, install a recent python version. Then you need to get the esptool via Pip: `pip install esptool` <br/>
-- The firmware.bin, bootloader.bin and partition.bin file is written after compiling to the hidden `.pio/build` directory of the MeshCom-Firmware repo directory.<br/>
 
-If you only update the firmware, you only want the corresponding file to flash.<br> Adresses where to flash each one of the files on an ESP32:<br/>
+### 1. Smart Desktop Flashing via CI Artifacts (Recommended for TTGO T-Beam)
+When you build your code using the **Automated Fork CI**, it generates a specialized, unzipped artifact package named `ttgo-tbeam-desktop-flasher`.
+This package contains the binaries and plug-and-play desktop helper scripts.
+
+1. Download the `ttgo-tbeam-desktop-flasher` artifact directory from your GitHub Action run.
+2. Connect your T-Beam board via a **USB Data Cable** to your computer.
+3. Run the script matching your operating system:
+   * **Linux:** Run `./flash_tbeam.sh` via your favorite shell (`bash`/`zsh`).
+   * **Windows:** Double-click `flash_tbeam.bat`.
+
+#### 💥 Core Features of the Desktop Flasher Scripts:
+* **Auto-Port Detection:** Automatically scans your connected hardware nodes for active USB-to-UART bridges (CP210x, CH340, CH9102) so you don't have to specify serial ports manually.
+* **Smart Bootloader Detection:** If `bootloader.bin` is present in the folder, the script automatically switches strategies to flash **both** the bootloader (at `0x1000`) and the firmware (at `0x10000`) sequentially. If missing, it flashes the firmware standalone at maximum safe speed (`921600` baud).
+* **Dynamic Permission Validation (Linux):** Dynamically probes which system group owns the hardware serial port (e.g., `uucp` on Arch Linux, `dialout` on Debian/Ubuntu), checks if your user is a member, and outputs exact correction commands if access is denied.
+
+---
+
+### 2. Manual ESP32 Flash via Command Line:
+If you prefer to flash everything manually using an installed `esptool.py` binary, navigate to your compiled `.pio/build/<board>` directory and utilize the following memory layouts:
+
+#### Classic ESP32 Boards (e.g., TTGO T-Beam V1.0 / V1.1)
 
 | Address | File |
 | --- | ----------- |
@@ -283,9 +188,11 @@ If you only update the firmware, you only want the corresponding file to flash.<
 | 0x10000 | safeboot.bin |
 | 0xC0000 | firmware.bin |
 
-`esptool.py -p <SERIAL_PORT> write_flash 0x1000 <PATH-TO-BIN-FILE>/bootloader.bin 0xE000 otadata.bin 0x8000 <PATH-TO-BIN-FILE>/partitions.bin 0x10000 <PATH-TO-BIN-FILE>/safeboot.bin 0xC0000 <PATH-TO-BIN-FILE>/firmware.bin `<br/>
+```bash
+esptool.py -p <SERIAL_PORT> write_flash 0x1000 bootloader.bin 0xE000 otadata.bin 0x8000 partitions.bin 0x10000 safeboot.bin 0xC0000 firmware.bin
+```
 
-For an ESP-S3 like the Heltec V3, E290, etc:
+#### ESP32-S3 Boards (e.g., Heltec V3, E290, T-Beam Supreme)
 
 | Address | File |
 | --- | ----------- |
@@ -295,47 +202,56 @@ For an ESP-S3 like the Heltec V3, E290, etc:
 | 0x10000 | safeboot-s3.bin |
 | 0xC0000 | firmware.bin |
 
-`esptool.py -p <SERIAL_PORT> write_flash 0x0000 <PATH-TO-BIN-FILE>/bootloader.bin 0xE000 otadata.bin 0x8000 <PATH-TO-BIN-FILE>/partitions.bin 0x10000 <PATH-TO-BIN-FILE>/safeboot-s3.bin 0xC0000 <PATH-TO-BIN-FILE>/firmware.bin `<br/>
+```bash
+esptool.py --chip esp32s3 -p <SERIAL_PORT> write_flash 0x0000 bootloader-s3.bin 0xE000 otadata.bin 0x8000 partitions.bin 0x10000 safeboot-s3.bin 0xC0000 firmware.bin
+```
 
-Ready build firmware can also be flashed via the online tool (Chrome, Edge, Opera):<br/>
-https://esptool.oevsv.at/<br/>
+*Alternatively, ready-built firmware images can be flashed inside a web browser using the [OEVSV Web Flasher](https://esptool.oevsv.at).*
+
+---
 
 ### OTA-Update:
-The safeboot.bin or safeboot-s3.bin contains the factory image which holds the OTA-Update firmware. To update via OTA after you have initially flashed the board, you can either enter the command `--ota-update` on the serial console or hit the OTA-Update Button in the webserver or in the phone app. The node then boots into the ota-firmware. If you had already configured your wifi credentials and had a connection to your wifi router, the node will try to connect again to that. Open the website via `<YOUR-NodeCALLSIGN>.local` or via its IP address. If there was no wifi configured upfront, the node then activates the AP mode and you can find a WiFi AP named `MeshCom-OTA` and the website of the OTA can either be accessed via the IP address: `192.168.4.1` or via `MeshCom-OTA.local`<br>
-If the upload fails it will always fall back to the OTA firmware.
+The `safeboot.bin` / `safeboot-s3.bin` images contain a lightweight factory firmware specifically for Over-The-Air web upgrades. 
 
-#### Erasing the Firmware: 
-If you want to wipe the firmware on the node:<br/>
-`python esptool.py --port <SERIAL-PORT> erase_flash`
-#### Erasing the NVS: 
-If you want to wipe the settings stored on the node:<br/>
-`python esptool.py --port <SERIAL-PORT> erase_region 0x009000 0x005000`
+1. Trigger OTA mode on your running node by entering the `--ota-update` CLI command over serial connection, or by clicking **OTA-Update** inside the integrated webserver or phone app.
+2. The node will reboot into safety mode. Connect to its local web panel either via `<YOUR-CALLSIGN>.local` (if router WiFi credentials were saved beforehand) or connect to the local Access Point hosted by the module named `MeshCom-OTA` (Password-free, accessible at `192.168.4.1` or `MeshCom-OTA.local`).
+3. Upload your binary directly through the browser interface.
+
+#### Erasing the Firmware completely: 
+```bash
+esptool.py --port <SERIAL-PORT> erase_flash
+```
+#### Erasing exclusively saved Node Settings (NVS Region): 
+```bash
+esptool.py --port <SERIAL-PORT> erase_region 0x009000 0x005000
+```
+
+---
+
 ### RAK4631 via CLI:
-To do so, you need the Adafruit-Nrfutil.<br/>
-First you need to have python 3 installed on your OS.<br/>
-Install the Adafruit-Nrfutil:<br/>
-`pip3 install adafruit-nrfutil`<br/>
-Next you need the .zip firmware file and not the uf2:<br/>
-https://github.com/icssw-org/MeshCom-Firmware/releases or download via the webflasher.<br/>
-Check your correct serial device! COM on Win or tty on Linux and MAC zb /dev/ttyACM0.<br/>
-Flashing via the command:<br/>
-`adafruit-nrfutil --verbose dfu serial --package wiscore_rak4631.zip -p <YOUR_CORRECT_SERIAL_DEVICE> --singlebank --touch 1200`<br/>
-More info on:<br/>
-https://github.com/adafruit/Adafruit_nRF52_nrfutil<br/>
+Requires `adafruit-nrfutil` (`pip3 install adafruit-nrfutil`). Uses the `.zip` archive instead of raw binaries:
+```bash
+adafruit-nrfutil --verbose dfu serial --package wiscore_rak4631.zip -p <SERIAL_PORT> --singlebank --touch 1200
+```
 
-### RAK4631 via UF2 File:
-When you double click the button on the module it mounts a USB Device where you can copy an .uf2 file onto the module. The uf2 file can be downloaded here:
-https://github.com/icssw-org/MeshCom-Firmware/releases or via the webflasher<br/>
-If you need to generate an uf2 from a hex file compiled you need the following Python script:<br/>
-https://github.com/microsoft/uf2/blob/master/utils/uf2conv.py<br/>
+### RAK4631 via UF2 File (Mass Storage Emulation):
+The WisBlock module supports a user-friendly USB mass storage bootloader for dragging and dropping firmware files.
 
-`./uf2conv.py <PATH_TO-HEX-FILE> -c -o firmware.uf2 -f 0xADA52840`
+1. Connect the RAK4631 module to your computer via a USB cable.
+2. Double-click the physical reset button on the module. The board will mount on your operating system as a standard USB drive named `RAK4631`.
+3. Drag and drop your compiled `.uf2` file directly onto the mounted drive. The module will automatically flash itself and reboot.
 
-### Updating the bootloader on RAK or erasing flash:
-Please follow the instructions here: https://icssw.org/en/rak-wisblock-anleitung/<br/>
+#### Generating a UF2 File from a compiled HEX File:
+If you need to manually convert a compiled `.hex` payload into a flashable `.uf2` image, use Microsoft's conversion utility:
 
+1. Download the official conversion script:
+   ```bash
+   wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py
+   ```
+2. Convert your firmware hex file using the specialized Nordic nRF52 family ID (`0xADA52840`):
+   ```bash
+   python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840
+   ```
 
 ## Icon Licensing
-MeshCom nutzt im UI ein GPS-Symbol sowie die Menü- (grün/rot) und Settings-Symbole von [WpZoom](https://www.wpzoom.com), die unter der [Creative Commons Attribution-Share Alike 3.0 Lizenz](https://creativecommons.org/licenses/by-sa/3.0/) bereitgestellt werden. Diese Symbole dürfen kopiert, angepasst und auch kommerziell verwendet werden, sofern auf jeder Seite, auf der die Symbole verwendet werden, ein Link zu [wpzoom.com](https://www.wpzoom.com) gesetzt wird.
-
-
+MeshCom utilizes a GPS symbol as well as menu (green/red) and settings symbols designed by [WpZoom](https://www.wpzoom.com), provided under the terms of the [Creative Commons Attribution-Share Alike 3.0 License](https://creativecommons.org/licenses/by-sa/3.0/).

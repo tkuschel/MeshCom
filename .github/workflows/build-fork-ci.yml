@@ -23,49 +23,65 @@ jobs:
     steps:
     # 1. Checkout the target branch instead of the workflow branch
     - name: Checkout Target Branch
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         ref: ${{ github.event.inputs.target_branch || github.ref }}
 
-    - uses: actions/cache@v5
+    # 2. Set up Python environment first so that pip paths are correctly resolved
+    - name: Set up Python ^3.13
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+
+    # 3. Cache global PlatformIO directories, local build files, and pip downloads
+    # Uses a dynamic key based on platformio.ini content to auto-invalidate when dependencies change
+    - name: Cache PlatformIO
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cache/pip
-          ~/.platformio/.cache
-        key: ${{ runner.os }}-pio
+          ~/.platformio
+          .pio
+        key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
+        restore-keys: |
+          ${{ runner.os }}-pio-
 
-    - name: Set up Python 3.13
-      uses: actions/setup-python@v7
-      with:
-        python-version: '3.13'
-
-    # using --quiet to keep the pip installation logs clean and readable
+    # 4. Install PlatformIO Core and the required intelhex extension in a single, quiet command
     - name: Install PlatformIO Core
-      run: pip install --quiet --upgrade platformio
+      run: python -m pip install --quiet --upgrade pip platformio intelhex
 
-    - name: Install esptool extension
-      run: pip install --quiet --upgrade intelhex
-
+    # 5. Pre-install required hardware platforms globally (heavily speeds up via the fixed cache)
     - name: Install RAK Deps
       run: pio pkg install --silent --global --platform nordicnrf52
 
     - name: Install ESP32 platform
       run: pio pkg install --silent --global --platform espressif32
 
+    # 6. Inject the custom LilyGo T-Beam Supreme board definition into the Espressif32 framework
     - name: Add T-Beam Supreme board definition
-      run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget --quiet -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
+      run: |
+        mkdir -p ~/.platformio/platforms/espressif32/boards
+        wget --quiet -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json
 
+    # 7. Compile all projects defined in the workspace silently
     - name: Build all Projects
-      run: "cd ${{ github.workspace }} && pio run --silent"
+      run: pio run --silent
 
+    # 8. Download the official Microsoft UF2 conversion utility once to avoid redundant downloads
+    - name: Download UF2 Converter Tools
+      run: |
+        wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py
+        wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json
+
+    # 9. Convert compiled .hex binaries into flashable .uf2 files for each target board
     - name: Convert RAK to UF2
-      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840"
+      run: python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840
 
     - name: Convert HELTEC_T114 to UF2
-      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/heltec_t114/firmware.hex -c -o .pio/build/heltec_t114/heltec_t114.uf2 -f 0xADA52840"
+      run: python3 uf2conv.py .pio/build/heltec_t114/firmware.hex -c -o .pio/build/heltec_t114/heltec_t114.uf2 -f 0xADA52840
 
     - name: Convert T_ECHO to UF2
-      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/t_echo/firmware.hex -c -o .pio/build/t_echo/t_echo.uf2 -f 0xADA52840"
+      run: python3 uf2conv.py .pio/build/t_echo/firmware.hex -c -o .pio/build/t_echo/t_echo.uf2 -f 0xADA52840
 
     - name: Rename Files and Print Progress
       run: |
@@ -101,9 +117,9 @@ jobs:
 
         echo "=== File Renaming Successfully Completed ==="
         echo "Listing renamed files in build directory:"
-        find .pio/build/ -name "*.bin" -o -name "*.zip" -o -name "*.uf2"
+        find .pio/build/ \( -name "*.bin" -o -name "*.zip" -o -name "*.uf2" \)
 
-    # 2. Upload all built files as GitHub Workflow Artifacts instead of creating a release
+    # 10. Upload all built files as GitHub Workflow Artifacts instead of creating a release
     - name: Upload Compiled Firmware Artifacts
       uses: actions/upload-artifact@v7
       with:
@@ -228,7 +244,7 @@ jobs:
         pause
         EOF
 
-    # Upload the T-Beam binary, bootloader and scripts with zip compression
+    # 12. Upload the T-Beam binary, bootloader and scripts with zip compression
     - name: Upload T-Beam Firmware and Flashing Scripts (Bundle)
       uses: actions/upload-artifact@v7
       with:
@@ -241,7 +257,7 @@ jobs:
         archive: true
         retention-days: 14
 
-    # Upload the single T-Beam binary directly without any zip compression
+    # 13. Upload the single T-Beam binary directly without any zip compression
     - name: Upload T-Beam Firmware (firmware binary w/o bootloader)
       uses: actions/upload-artifact@v7
       with:

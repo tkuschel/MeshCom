@@ -21,7 +21,7 @@ jobs:
       contents: read # Changed from write since we don't create an official Release anymore
 
     steps:
-    # 1. Checkout the target feature branch instead of the workflow branch
+    # 1. Checkout the target branch instead of the workflow branch
     - name: Checkout Target Branch
       uses: actions/checkout@v4
       with:
@@ -109,8 +109,6 @@ jobs:
       with:
         name: firmware-build-${{ github.event.inputs.target_branch || github.ref_name }}
         path: |
-          safeboot.bin
-          safeboot-s3.bin
           .pio/build/**/*.bin
           .pio/build/**/*.zip
           .pio/build/**/*.uf2
@@ -120,6 +118,9 @@ jobs:
     # with optional bootloader detection and group check
     - name: Create Desktop Flashing Scripts
       run: |
+        # Ensure the directory exists before attempting to write scripts into it
+        mkdir -p .pio/build/ttgo_tbeam
+
         # 1. Create the smart Linux Shell Script
         cat << 'EOF' > .pio/build/ttgo_tbeam/flash_tbeam.sh
         #!/usr/bin/env bash
@@ -132,7 +133,7 @@ jobs:
 
         if ! command -v esptool.py &> /dev/null; then
             echo -e "${RED}Error: esptool.py is not installed.${NC}"
-            echo "Please install it via Arch Linux e.g.: yay esptool or via pip: pip install esptool"
+            echo "Please install it via Arch Linux, e.g.: 'yay -S esptool' or via pip: 'pip install esptool'"
             exit 1
         fi
 
@@ -151,12 +152,14 @@ jobs:
                 echo -e "The device belongs to the group: ${YELLOW}$REQUIRED_GROUP${NC}"
                 echo -e "Please add your user to this group by running:"
                 echo -e "  ${GREEN}sudo usermod -aG $REQUIRED_GROUP \$USER${NC}"
-                echo -e "After running the command, please log out and log back in for changes to take effect."
+                echo -e "After running the command, please log out and log back in for the changes to take effect."
                 exit 1
             fi
         fi
 
         FIRMWARE="ttgo_tbeam.bin"
+        BOOTLOADER="bootloader.bin"
+
         if [ ! -f "$FIRMWARE" ]; then
             echo -e "${RED}Error: File '$FIRMWARE' not found!${NC}"
             exit 1
@@ -225,15 +228,23 @@ jobs:
         pause
         EOF
 
-    # Uploads the single T-Beam binary directly without any zip compression
-    - name: Upload T-Beam Firmware and Flashing Scripts (Unzipped Bundle)
+    # Upload the T-Beam binary, bootloader and scripts with zip compression
+    - name: Upload T-Beam Firmware and Flashing Scripts (Bundle)
       uses: actions/upload-artifact@v7
       with:
-        name: ttgo-tbeam-desktop-flasher
+        name: ttgo-tbeam-desktop-flasher-${{ github.event.inputs.target_branch || github.ref_name }}
         path: |
           .pio/build/ttgo_tbeam/ttgo_tbeam.bin
           .pio/build/ttgo_tbeam/bootloader.bin
           .pio/build/ttgo_tbeam/flash_tbeam.sh
           .pio/build/ttgo_tbeam/flash_tbeam.bat
+        archive: true
+        retention-days: 14
+
+    # Upload the single T-Beam binary directly without any zip compression
+    - name: Upload T-Beam Firmware (firmware binary w/o bootloader)
+      uses: actions/upload-artifact@v7
+      with:
+        path: .pio/build/ttgo_tbeam/ttgo_tbeam.bin
         archive: false
         retention-days: 14

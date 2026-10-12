@@ -34,10 +34,10 @@ jobs:
           ~/.platformio/.cache
         key: ${{ runner.os }}-pio
 
-    - name: Set up Python 3.12
+    - name: Set up Python 3.13
       uses: actions/setup-python@v7
       with:
-        python-version: '3.12'
+        python-version: '3.13'
 
     # using --quiet to keep the pip installation logs clean and readable
     - name: Install PlatformIO Core
@@ -55,14 +55,8 @@ jobs:
     - name: Add T-Beam Supreme board definition
       run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget --quiet -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
 
-    - name: Clean PlatformIO Cache
-      run: pio run --target clean
-
     - name: Build all Projects
-    # Adjusted flags: warnings are shown, but framework debug output is limited to WARN (level 2)
-      env:
-        PLATFORMIO_BUILD_FLAGS: "-DCORE_DEBUG_LEVEL=2"
-      run: "cd ${{ github.workspace }} && pio run"
+      run: "cd ${{ github.workspace }} && pio run --silent"
 
     - name: Convert RAK to UF2
       run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840"

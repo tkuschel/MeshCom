@@ -37,83 +37,75 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-
+        
+    # using --quiet to keep the pip installation logs clean and readable
     - name: Install PlatformIO Core
-      run: pip install --upgrade platformio
+      run: pip install --quiet --upgrade platformio
 
     - name: Install esptool extension
-      run: pip install --upgrade intelhex
+      run: pip install --quiet --upgrade intelhex
 
     - name: Install RAK Deps
-      run: pio pkg install --global --platform nordicnrf52
+      run: pio pkg install --quiet --global --platform nordicnrf52
 
     - name: Install ESP32 platform
-      run: pio pkg install --global --platform espressif32
+      run: pio pkg install --quiet --global --platform espressif32
 
     - name: Add T-Beam Supreme board definition
-      run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
+      run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget --quiet -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
 
     - name: Build all Projects
+    # Adjusted flags: warnings are shown, but framework debug output is limited to WARN (level 2)
+      env:
+        PLATFORMIO_BUILD_FLAGS: "-DCORE_DEBUG_LEVEL=2"
       run: "cd ${{ github.workspace }} && pio run"
 
     - name: Convert RAK to UF2
-      run: "wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840"
+      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/wiscore_rak4631/firmware.hex -c -o .pio/build/wiscore_rak4631/wiscore_rak4631.uf2 -f 0xADA52840"
 
     - name: Convert HELTEC_T114 to UF2
-      run: "wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/heltec_t114/firmware.hex -c -o .pio/build/heltec_t114/heltec_t114.uf2 -f 0xADA52840"
+      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/heltec_t114/firmware.hex -c -o .pio/build/heltec_t114/heltec_t114.uf2 -f 0xADA52840"
 
     - name: Convert T_ECHO to UF2
-      run: "wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/t_echo/firmware.hex -c -o .pio/build/t_echo/t_echo.uf2 -f 0xADA52840"
+      run: "wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2conv.py && wget --quiet https://raw.githubusercontent.com/microsoft/uf2/refs/heads/master/utils/uf2families.json && python3 uf2conv.py .pio/build/t_echo/firmware.hex -c -o .pio/build/t_echo/t_echo.uf2 -f 0xADA52840"
 
     - name: Rename Files and Print Progress
       run: |
         echo "=== Starting File Renaming Process ==="
 
         echo "Processing DevKitC and T-Deck boards..."
-        mv .pio/build/E22_1262-DevKitC/firmware.bin .pio/build/E22_1262-DevKitC/E22_1262-DevKitC.bin
-        mv .pio/build/E22-DevKitC/firmware.bin .pio/build/E22-DevKitC/E22-DevKitC.bin
-        mv .pio/build/t_deck/firmware.bin .pio/build/t_deck/t_deck.bin
-        mv .pio/build/t_deck_plus/firmware.bin .pio/build/t_deck_plus/t_deck_plus.bin
-        mv .pio/build/t_deck_pro/firmware.bin .pio/build/t_deck_pro/t_deck_pro.bin
-        mv .pio/build/E22_XML-DevKitC/firmware.bin .pio/build/E22_XML-DevKitC/E22_XML-DevKitC.bin
-        mv .pio/build/E22_1262_S3-DevKitC-1-N16R8/firmware.bin .pio/build/E22_1262_S3-DevKitC-1-N16R8/E22_1262_S3-DevKitC-1-N16R8.bin
-        mv .pio/build/E22_1268_S3-DevKitC-1-N16R8/firmware.bin .pio/build/E22_1268_S3-DevKitC-1-N16R8/E22_1268_S3-DevKitC-1-N16R8.bin
-
-        echo "Processing Heltec boards..."
-        mv .pio/build/heltec_wifi_lora_32_V2/firmware.bin .pio/build/heltec_wifi_lora_32_V2/heltec_wifi_lora_32_V2.bin
-        mv .pio/build/heltec_wifi_lora_32_V3/firmware.bin .pio/build/heltec_wifi_lora_32_V3/heltec_wifi_lora_32_V3.bin
-        mv .pio/build/heltec_wifi_lora_32_V4/firmware.bin .pio/build/heltec_wifi_lora_32_V4/heltec_wifi_lora_32_V4.bin
-        mv .pio/build/heltec_wireless_stick/firmware.bin .pio/build/heltec_wireless_stick/heltec_wireless_stick.bin
-        mv .pio/build/heltec_wireless_tracker/firmware.bin .pio/build/heltec_wireless_tracker/heltec_wireless_tracker.bin
-
-        echo "Processing TTGO and Vision Master boards..."
-        mv .pio/build/ttgo-lora32-v21/firmware.bin .pio/build/ttgo-lora32-v21/ttgo-lora32-v21.bin
-        mv .pio/build/ttgo_tbeam/firmware.bin .pio/build/ttgo_tbeam/ttgo_tbeam.bin
-        mv .pio/build/ttgo_tbeam_SX1262/firmware.bin .pio/build/ttgo_tbeam_SX1262/ttgo_tbeam_SX1262.bin
-        mv .pio/build/ttgo_tbeam_SX1268/firmware.bin .pio/build/ttgo_tbeam_SX1268/ttgo_tbeam_SX1268.bin
-        mv .pio/build/ttgo_tbeam_supreme/firmware.bin .pio/build/ttgo_tbeam_supreme/ttgo_tbeam_supreme.bin
-        mv .pio/build/vision-master-e290/firmware.bin .pio/build/vision-master-e290/vision-master-e290.bin
-        mv .pio/build/vision-master-e213/firmware.bin .pio/build/vision-master-e213/vision-master-e213.bin
-
-        echo "Processing LoRaPRS, Wireless Paper and LilyGo boards..."
-        mv .pio/build/esp32-loraprs-e22/firmware.bin .pio/build/esp32-loraprs-e22/esp32-loraprs-e22.bin
-        mv .pio/build/esp32-loraprs-ra01/firmware.bin .pio/build/esp32-loraprs-ra01/esp32-loraprs-ra01.bin
-        mv .pio/build/wireless-paper/firmware.bin .pio/build/wireless-paper/wireless-paper.bin
-        mv .pio/build/LilyGo_T-Beam-1W/firmware.bin .pio/build/LilyGo_T-Beam-1W/T-Beam-1W.bin
-        mv .pio/build/LilyGo_T3_S3_V1_3/firmware.bin .pio/build/LilyGo_T3_S3_V1_3/T3_S3_V13.bin
-        mv .pio/build/LilyGo_T_Connect_Pro/firmware.bin .pio/build/LilyGo_T_Connect_Pro/t_connect_pro.bin
-
-        echo "Processing ZIP archives and Bootloaders..."
-        mv .pio/build/wiscore_rak4631/firmware.zip .pio/build/wiscore_rak4631/wiscore_rak4631.zip
-        mv .pio/build/heltec_t114/firmware.zip .pio/build/heltec_t114/heltec_t114.zip
-        mv .pio/build/t_echo/firmware.zip .pio/build/t_echo/t_echo.zip
-        mv .pio/build/esp32-S3-safeboot/bootloader.bin .pio/build/esp32-S3-safeboot/bootloader-s3.bin
+        # Automatically loop through all build directories to rename firmware files dynamically
+        # This handles DevKitC, Heltec, TTGO, LilyGo, and any future boards automatically
+        for dir in .pio/build/*/; do
+          if [ -d "$dir" ]; then
+            # Extract the pure board name from the directory path
+            board=$(basename "$dir")
+            
+            # 1. Rename standard ESP32 firmware binaries
+            if [ -f "${dir}firmware.bin" ]; then
+              echo "Processing binary for board: $board"
+              mv "${dir}firmware.bin" "${dir}${board}.bin"
+            fi
+            
+            # 2. Rename NRF52 / Nordic ZIP archives (e.g., RAK4631, T-Echo)
+            if [ -f "${dir}firmware.zip" ] && [ "$board" != "esp32-S3-safeboot" ]; then
+              echo "Processing ZIP for board: $board"
+              mv "${dir}firmware.zip" "${dir}${board}.zip"
+            fi
+          fi
+        done
+        
+        # Handle the unique exceptions manually
+        echo "Processing special bootloaders..."
+        if [ -f .pio/build/esp32-S3-safeboot/bootloader.bin ]; then
+          mv .pio/build/esp32-S3-safeboot/bootloader.bin .pio/build/esp32-S3-safeboot/bootloader-s3.bin
+        fi
 
         echo "=== File Renaming Successfully Completed ==="
         echo "Listing renamed files in build directory:"
         find .pio/build/ -name "*.bin" -o -name "*.zip" -o -name "*.uf2"
 
-    # 2. NEW: Upload all built files as GitHub Workflow Artifacts instead of creating a release
+    # 2. Upload all built files as GitHub Workflow Artifacts instead of creating a release
     - name: Upload Compiled Firmware Artifacts
       uses: actions/upload-artifact@v4
       with:

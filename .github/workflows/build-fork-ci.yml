@@ -34,10 +34,10 @@ jobs:
           ~/.platformio/.cache
         key: ${{ runner.os }}-pio
 
-    - name: Set up Python 3.13
+    - name: Set up Python 3.12
       uses: actions/setup-python@v7
       with:
-        python-version: '3.13'
+        python-version: '3.12'
 
     # using --quiet to keep the pip installation logs clean and readable
     - name: Install PlatformIO Core

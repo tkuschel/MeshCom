@@ -55,6 +55,9 @@ jobs:
     - name: Add T-Beam Supreme board definition
       run: "mkdir -p ~/.platformio/platforms/espressif32/boards && wget --quiet -O ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json https://raw.githubusercontent.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/master/boards/t-beams3-supreme.json && cat ~/.platformio/platforms/espressif32/boards/t-beams3-supreme.json"
 
+    - name: Clean PlatformIO Cache
+      run: pio run --target clean
+
     - name: Build all Projects
     # Adjusted flags: warnings are shown, but framework debug output is limited to WARN (level 2)
       env:

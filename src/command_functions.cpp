@@ -11,10 +11,12 @@
 #include "command_match.h" // D2-10: commandMatches(), the ladder's matching rule
 #include "command_toggles.h" // D2-06: the table-driven on/off toggles
 #include "command_setters.h" // D2-07: numeric argument parse/range/store
+#include "node_position.h"    // DRY-01: hemisphere split / signed decode of the own position
 #include "instrument.h"     // TEMPORARY -- measurement scaffolding, see src/instrument.h
 #include "batt_functions.h"
 #include "nbr_matrix.h"
 #include "nbr_views.h"      // W4b: --mheard/--path lesen nur noch ueber die Abfrageschicht
+#include <extudp_target.h>
 #include <TinyGPSPlus.h>    // DIST fuer --mheard -- reine distanceBetween()-Rechnung, kein GPS-Modul noetig
 #include "udp_functions.h"
 #include "radio_units.h"   // RF-01..RF-03 unit conversions
@@ -22,6 +24,8 @@
 #include "ntp_async.h"
 #include "ble_json_frame.h"
 #include "ble_phone_drain.h"   // BLE-N1/N2: blePhoneStatsFormat(), g_blePhoneStats
+#include "ble_session.h"       // BLC-03: BleStats, g_bleStats, bleStatsFormat()
+#include "charge_led_mode.h"  // CHG-01/02: SSET2_CHGLED_CFG marker for the charge LED rows
 #include "i2c_scanner.h"
 #include "ArduinoJson.h"
 #include "configuration.h"
@@ -43,6 +47,8 @@
 #endif
 #include "tinyxml_functions.h"
 #include "clock.h"
+#include "tz_rule.h" // TZ-01: tzParse(), tzRejectReason() for --settz
+#include "esp32/netif_mtu.h" // NMTU-01: --mtu applies to live netifs (ESP32 part compiled out elsewhere)
 
 #ifdef ESP32
 #include "esp32/esp32_functions.h"
@@ -114,6 +120,7 @@ extern TinyGPSPlus gps;
 #endif
 #include "test_inject.h"
 #include "loop_breadcrumb.h"   // F3: --info ...BOOT line
+#include "gw_link_status.h"   // --info ...Server line
 
 #if defined(BOARD_T5_EPAPER)
 #include <t5-epaper/t5epaper_extern.h>
@@ -321,8 +328,9 @@ static void tg_post_ina226_on() { setupINA226(); }
 static void tg_post_ina226_off() { ina226_found = false; }
 #endif
 #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
-static void tg_post_charge_led_on() { setChargeLedOn(true); }
-static void tg_post_charge_led_off() { setChargeLedOn(false); }
+// both rows are TG_POST_FIRST: the CFG marker must be in node_sset2 before save_settings() (CHG-01/02)
+static void tg_post_charge_led_on() { meshcom_settings.node_sset2 |= SSET2_CHGLED_CFG; setChargeLedOn(true); }
+static void tg_post_charge_led_off() { meshcom_settings.node_sset2 |= SSET2_CHGLED_CFG; setChargeLedOn(false); }
 #endif
 #ifdef BOARD_LED
     #ifndef BOARD_LED_ACTIVE_LOW
@@ -464,8 +472,8 @@ static const ToggleRow COMMAND_TOGGLES[] =
     { "--ina226 off",         &bINA226ON,            &meshcom_settings.node_sset3,    0xFFFFF7FF,   0x00000000,   tg_post_ina226_off,            TG_DIRTY_SENS,   TG_SAVE | TG_BRETURN },
 #endif
 #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
-    { "--charge led on",      &bCHARGE_LED,          &meshcom_settings.node_sset3,    0xFFFFFFFF,   0x0001,       tg_post_charge_led_on,         TG_DIRTY_NONE,   TG_SAVE | TG_BRETURN | TG_FLAG_TRUE },
-    { "--charge led off",     &bCHARGE_LED,          &meshcom_settings.node_sset3,    0xFFFFFFFE,   0x00000000,   tg_post_charge_led_off,        TG_DIRTY_NONE,   TG_SAVE | TG_BRETURN },
+    { "--charge led on",      &bCHARGE_LED,          &meshcom_settings.node_sset3,    0xFFFFFFFF,   0x0001,       tg_post_charge_led_on,         TG_DIRTY_NONE,   TG_SAVE | TG_BRETURN | TG_FLAG_TRUE | TG_POST_FIRST },
+    { "--charge led off",     &bCHARGE_LED,          &meshcom_settings.node_sset3,    0xFFFFFFFE,   0x00000000,   tg_post_charge_led_off,        TG_DIRTY_NONE,   TG_SAVE | TG_BRETURN | TG_POST_FIRST },
 #endif
 #ifdef BOARD_LED
     { "--board led on",       &bUSER_BOARD_LED,      &meshcom_settings.node_sset3,    0xFFFFFFFF,   0x0080,       nullptr,                       TG_DIRTY_NODE,   TG_SAVE | TG_BRETURN | TG_FLAG_TRUE },
@@ -593,6 +601,54 @@ static void cmdArgNotNumber(const char *label, const char *arg)
     printfdeb("%s: <%s> is not a number\n", label, arg);
 }
 
+// DRY-01: the one own-position setter behind --setlat/--setlon/--setalt and the BLE phone frames.
+// Lat/lon are range-checked (-90..90, -180..180) and stored as magnitude + hemisphere
+// letter; on reject nothing is touched. Saving is the caller's job.
+bool nodeSetLat(double lat)
+{
+    double mag;
+    char hem;
+    if(!nodeLatSplit(lat, mag, hem))
+        return false;
+    meshcom_settings.node_lat = mag;
+    meshcom_settings.node_lat_c = hem;
+    return true;
+}
+
+bool nodeSetLon(double lon)
+{
+    double mag;
+    char hem;
+    if(!nodeLonSplit(lon, mag, hem))
+        return false;
+    meshcom_settings.node_lon = mag;
+    meshcom_settings.node_lon_c = hem;
+    return true;
+}
+
+// The altitude filter / barometer reference follow the new value (GPS-03/F7). The caller range-checks.
+void nodeSetAlt(int alt)
+{
+    meshcom_settings.node_alt = alt;
+
+#ifdef ENABLE_GPS
+    WZ_GPS_AltSeed((float)alt);
+#else
+    baroBaseRelatch((float)alt);
+#endif
+}
+
+// Serial/console report of a rejected --setlat/--setlon (same style as the --setalt range reject).
+static void cmdPosRange(const char *label, const char *range, const char *msg_text, bool ble)
+{
+    printfdeb("%s out of range (%s), ignored\n", label, range);
+
+    if(ble)
+    {
+        addBLECommandBack((char*)msg_text);
+    }
+}
+
 void commandAction(char *umsg_text, bool ble)
 {
     // -info
@@ -704,11 +760,66 @@ void commandAction(char *umsg_text, bool ble)
     else
     if(commandCheck(msg_text+2, (char*)"utcoff") == 0)
     {
-        sscanf(msg_text+9, "%f", &meshcom_settings.node_utcoff);
+        const bool bUtcParsed = (sscanf(msg_text+9, "%f", &meshcom_settings.node_utcoff) == 1);
         // TODO: adapt node_time accordingly!
+
+        // TZ-01 D1: a manual offset wins over a TZ rule -- the rule would
+        // otherwise overwrite this value again within a minute. Only a value
+        // that actually parsed clears the rule.
+        if(bUtcParsed && meshcom_settings.node_tz[0] != '\0')
+        {
+            meshcom_settings.node_tz[0] = '\0';
+            printfdeb("utcoff: TZ rule cleared, fixed offset %.1f h\n", meshcom_settings.node_utcoff);
+        }
 
         if(bBLEDEBUG)
             printfdeb("[COMMAND]utcoff:%f\n", meshcom_settings.node_utcoff);
+
+        if(ble)
+        {
+            sendNodeSetting();
+            sendGpsJson();
+        }
+
+        save_settings();
+
+        return;
+    }
+    else
+    if(commandCheck(msg_text+2, (char*)"settz") == 0)
+    {
+        // TZ-01: --settz <POSIX rule>  e.g. CET-1CEST,M3.5.0,M10.5.0/3
+        //        --settz none (or no argument): back to the fixed --utcoff
+        // The rule is validated first; a refused rule changes nothing.
+        const char *tzArg = msg_text+7;
+        while(*tzArg == ' ')
+            tzArg++;
+
+        if(*tzArg == '\0' || casecmp((char*)tzArg, (char*)"none") == 0)
+        {
+            // node_utcoff keeps its current (last derived) value
+            meshcom_settings.node_tz[0] = '\0';
+
+            printfdeb("TZ none, fixed UTC%+.1f\n", meshcom_settings.node_utcoff);
+        }
+        else
+        {
+            TzRule tzCheck;
+
+            if(!tzParse(tzArg, &tzCheck))
+            {
+                printfdeb("settz: rejected <%s>: %s\n", tzArg, tzRejectReason(tzArg));
+
+                return;
+            }
+
+            snprintf(meshcom_settings.node_tz, sizeof(meshcom_settings.node_tz), "%s", tzArg);
+
+            tzApplyNow();
+
+            const char *tzAbbr = tzActiveAbbrev();
+            printfdeb("TZ %s, now %s UTC%+.1f\n", meshcom_settings.node_tz, tzAbbr ? tzAbbr : "?", meshcom_settings.node_utcoff);
+        }
 
         if(ble)
         {
@@ -1097,7 +1208,7 @@ void commandAction(char *umsg_text, bool ble)
             #endif
             delay(100);
 
-            printdeb("\n== Node ==\n--setcall <call>        callsign (OE0XXX-1)\n--setname <name>/none   operator first name (alias --operatorname)\n--setctry 0-99          country -> LoRa preset\n--setgrc 9;..9;         groups\n--utcoff +/-99.9        UTC offset h\n--settime yyyy.mm.dd hh:mm:ss  set clock\n");
+            printdeb("\n== Node ==\n--setcall <call>        callsign (OE0XXX-1)\n--setname <name>/none   operator first name (alias --operatorname)\n--setctry 0-99          country -> LoRa preset\n--setgrc 9;..9;         groups\n--utcoff +/-99.9        UTC offset h (clears --settz)\n--settz <rule>|none    POSIX TZ rule, e.g. CET-1CEST,M3.5.0,M10.5.0/3\n--settime yyyy.mm.dd hh:mm:ss  set clock\n");
             #if defined(ENABLE_RTC)
             printdeb("--setrtc yyyy.mm.dd hh:mm:ss  set RTC chip\n");
             #endif
@@ -1157,9 +1268,7 @@ void commandAction(char *umsg_text, bool ble)
             #ifndef BOARD_RAK4630
             printdeb("--setssid <ssid>/none   WLAN SSID\n--setpwd <pwd>/none     WLAN password\n--wifiap on/off         WLAN access point\n");
             #endif
-            #if defined(BOARD_RAK4630)
-            printdeb("--ethmtu 1280-1500      Ethernet MTU (web GUI, HAMNET tunnels)\n");
-            #endif
+            printdeb("--mtu 1280-1500         MTU, default 1280 (alias --ethmtu)\n");
             printdeb("--wifitxpower 2-20      WiFi TX power dBm\n--setownip a.b.c.d      static IP\n--setowngw a.b.c.d      gateway\n--setownms a.b.c.d      netmask\n--setowndns a.b.c.d     DNS server\n--setownntp a.b.c.d     NTP server\n");
             #ifndef BOARD_RAK4630
             #if defined(HAS_ETHERNET)
@@ -2140,7 +2249,7 @@ void commandAction(char *umsg_text, bool ble)
         bmp3_found=false;
         
         meshcom_settings.node_sset = meshcom_settings.node_sset & 0x7E7F;   // BME280/BMP280 off
-        meshcom_settings.node_sset3 = meshcom_settings.node_sset3 & 0x7FEF;   // BMP390 off
+        meshcom_settings.node_sset3 &= ~0x0010;   // BMP390 off (only bit 0x0010; 0x8000 NOPMOTHER and the upper bits stay)
 
         // N-28: "--bmx" ist das Sammelkommando, und die Hilfe sagt seit jeher
         // "--bmx BME/BMP/680 off". Der BME680 wurde davon aber nie erfasst.
@@ -2301,7 +2410,7 @@ void commandAction(char *umsg_text, bool ble)
     {
         bGATEWAY_NOPOS=false;
         
-        meshcom_settings.node_sset2 = meshcom_settings.node_sset2 & 0x7EFF;
+        meshcom_settings.node_sset2 = meshcom_settings.node_sset2 & 0xFFFFFEFF;
 
         if(ble)
         {
@@ -2336,9 +2445,9 @@ void commandAction(char *umsg_text, bool ble)
         String strCtry = _owner_c;
         strCtry.toUpperCase();
 
-        if(strCtry != "OE" && strCtry != "DL" && strCtry != "IT")
+        if(strCtry != "OE" && strCtry != "DL" && strCtry != "IT" && strCtry != "HC" && strCtry != "HB")
         {
-            printfdeb("\nGateway-Server fault <%s> please only OE or DL or IT\n", strCtry.c_str());
+            printfdeb("\nGateway-Server fault <%s> please only OE,HC,DL, IT or HB\n", strCtry.c_str());
             return;
         }
 
@@ -2378,7 +2487,7 @@ void commandAction(char *umsg_text, bool ble)
     if(commandCheck(msg_text+2, (char*)"netconsole off") == 0)
     {
         bNETCONSOLE=false;
-        meshcom_settings.node_sset2 = meshcom_settings.node_sset2 & 0x6FFF;
+        meshcom_settings.node_sset2 = meshcom_settings.node_sset2 & 0xFFFFEFFF;
 
         save_settings();
 
@@ -2613,7 +2722,10 @@ void commandAction(char *umsg_text, bool ble)
         // max. 40 char
         msg_text[50]=0x00;
 
-        snprintf(meshcom_settings.node_extern, sizeof(meshcom_settings.node_extern), "%s", msg_text+11);
+        // EXT-01: "--extudpip" with no argument used to read past the terminator
+        // into stale buffer content ("EXT IP 5 t=219029" seen on the bench);
+        // an argument-less call clears the field like "none".
+        snprintf(meshcom_settings.node_extern, sizeof(meshcom_settings.node_extern), "%s", (strlen(msg_text) > 11) ? msg_text+11 : "none");
 
         if(is_equ(meshcom_settings.node_extern, "none"))
         {
@@ -2621,10 +2733,13 @@ void commandAction(char *umsg_text, bool ble)
         }
         else
         {
-            if(strcmp(meshcom_settings.node_extern, meshcom_settings.node_ip) == 0)
+            // EXT-03: no broadcast/multicast target (a 255.255.255.255 was seen in
+            // the field: every heard frame went to the whole LAN); own IP as before
+            ExtudpTargetVerdict tv = extudp_target_check(meshcom_settings.node_extern, meshcom_settings.node_ip, meshcom_settings.node_subnet);
+            if(tv != EXTUDP_TARGET_OK)
             {
+                printfdeb("\nEXTERNAL-IP:%s refused - %s\n", meshcom_settings.node_extern, extudp_target_reason(tv));
                 snprintf(meshcom_settings.node_extern, sizeof(meshcom_settings.node_extern), "%s", "");
-                printfdeb("\nEXTERNAL-IP:%s is same as Own-IP - please set another IP\n", meshcom_settings.node_extern);
                 return;
             }
         }
@@ -3503,20 +3618,21 @@ void commandAction(char *umsg_text, bool ble)
         save_settings();
     }
     else
-    // Issue #1183: Ethernet MTU for the RAK W5100S web server (applied as MSS = MTU - 40
-    // on the next listening socket, see web_functions.cpp). Unlike --pingmax a bad value
-    // is rejected, not reset: a typo must not silently change the path MTU. RAK only, like
-    // its --help line: the MSS is applied by the W5100S path alone.
-    #if defined(BOARD_RAK4630)
-    if(commandCheck(msg_text+2, (char*)"ethmtu ") == 0)
+    // Issues #1183/#1190: user MTU on every board (key node_ethmtu). On RAK it is applied as
+    // MSS = MTU - 40 on the next listening socket (web_functions.cpp); elsewhere via the netif
+    // MTU. Unlike --pingmax a bad value is rejected, not reset: a typo must not silently
+    // change the path MTU. --ethmtu is the old name, kept as an alias with its own offset.
+    if(commandCheck(msg_text+2, (char*)"mtu ") == 0 || commandCheck(msg_text+2, (char*)"ethmtu ") == 0)
     {
-        const CmdSetResult res = cmdStoreInt(msg_text+9, &meshcom_settings.node_ethmtu, 1280, 1500, &iVar);
+        const bool bMtuShort = (commandCheck(msg_text+2, (char*)"mtu ") == 0);
+        const char *mtuArg = bMtuShort ? msg_text+6 : msg_text+9;
+        const CmdSetResult res = cmdStoreInt(mtuArg, &meshcom_settings.node_ethmtu, 1280, 1500, &iVar);
 
-        if(res == CMD_SET_NAN) { cmdArgNotNumber("ethmtu", msg_text+9); return; }
+        if(res == CMD_SET_NAN) { cmdArgNotNumber(bMtuShort ? "mtu" : "ethmtu", mtuArg); return; }
 
         if(res == CMD_SET_RANGE)
         {
-            printfdeb("ethmtu %i not between 1280 and 1500, ignored\n", iVar);
+            printfdeb("mtu %i not between 1280 and 1500, ignored\n", iVar);
 
             if(ble)
             {
@@ -3526,14 +3642,19 @@ void commandAction(char *umsg_text, bool ble)
             return;
         }
 
-        printfdeb("set ethmtu to %i (MSS %i)\n", meshcom_settings.node_ethmtu, meshcom_settings.node_ethmtu - 40);
+        printfdeb("set mtu to %i (MSS %i)\n", meshcom_settings.node_ethmtu, meshcom_settings.node_ethmtu - 40);
+
+        #if defined(ESP32)
+        // NMTU-01: live netifs take it now (new TCP connections); the event hooks
+        // re-apply it on the next link-up.
+        netif_mtu::applyConfiguredMtu(meshcom_settings.node_ethmtu);
+        #endif
 
         bReturn = true;
 
         save_settings();
     }
     else
-    #endif
 
 #ifndef BOARD_RAK4630
     if(commandCheck(msg_text+2, (char*)"setssid ") == 0)
@@ -3865,7 +3986,7 @@ void commandAction(char *umsg_text, bool ble)
         return;
     }
     else
-    if(commandCheck(msg_text+2, (char*)"setinet") == 0 || commandCheck(msg_text+2, (char*)"sethamnet off") == 0)
+    if(commandCheck(msg_text+2, (char*)"setinet on") == 0 || commandCheck(msg_text+2, (char*)"sethamnet off") == 0)
     {
         meshcom_settings.node_hamnet_only = 0;
         
@@ -3891,16 +4012,7 @@ void commandAction(char *umsg_text, bool ble)
 
         if(!bArgOk) { cmdArgNotNumber("setlat", msg_text+9); return; }
 
-        //printf("_owner_c:%s fVar:%f\n", _owner_c, dVar);
-
-        meshcom_settings.node_lat_c='N';
-        meshcom_settings.node_lat=dVar;
-
-        if(dVar < 0)
-        {
-            meshcom_settings.node_lat_c='S';
-            meshcom_settings.node_lat=fabs(dVar);
-        }
+        if(!nodeSetLat(dVar)) { cmdPosRange("setlat", "-90..90", msg_text, ble); return; }
 
         save_settings();
         
@@ -3913,16 +4025,7 @@ void commandAction(char *umsg_text, bool ble)
 
         if(!bArgOk) { cmdArgNotNumber("setlon", msg_text+9); return; }
 
-        meshcom_settings.node_lon=dVar;
-
-        meshcom_settings.node_lon_c='E';
-        meshcom_settings.node_lon=dVar;
-
-        if(dVar < 0)
-        {
-            meshcom_settings.node_lon_c='W';
-            meshcom_settings.node_lon=fabs(dVar);
-        }
+        if(!nodeSetLon(dVar)) { cmdPosRange("setlon", "-180..180", msg_text, ble); return; }
 
         save_settings();
         
@@ -3950,13 +4053,7 @@ void commandAction(char *umsg_text, bool ble)
             return;
         }
 
-        meshcom_settings.node_alt=iVar;
-
-        #ifdef ENABLE_GPS
-        WZ_GPS_AltSeed((float)iVar);
-        #else
-        baroBaseRelatch((float)iVar);
-        #endif
+        nodeSetAlt(iVar);
 
         printfdeb("set alt to %i m\n", meshcom_settings.node_alt);
 
@@ -6201,6 +6298,11 @@ void commandAction(char *umsg_text, bool ble)
 
             printfdeb("...Flash-Version %i\n", meshcom_settings.node_fversion);
 
+            {
+                const char *tzAbbr = tzActiveAbbrev();
+                printfdeb("...TZ %s ...TZOFF %+.1f h [%s]\n", (meshcom_settings.node_tz[0] ? meshcom_settings.node_tz : "none"), meshcom_settings.node_utcoff, (tzAbbr ? tzAbbr : "-"));
+            }
+
             printfdeb("...NOMSGALL %s ...MESH %s ...BUTTON (%i) %s ...SOFTSER %s ... SOFTSERREAD %s\n...PASSWD <%s>\n",
                 (bNoMSGtoALL?"on":"off"), (bMESH?"on":"off"), ibt, (bButtonCheck?"on":"off"), (bSOFTSERON?"on":"off"), (bSOFTSERREAD?"on":"off"), maskSecret(meshcom_settings.node_passwd));
 
@@ -6251,6 +6353,11 @@ void commandAction(char *umsg_text, bool ble)
             printfdeb("...APRSMC: %s\n...ATXT: %s\n...NAME: %s\n...BLE : %s %s\n...DISPLAY %s\n...CTRY %s\n...FREQ %.4f MHz TXPWR %i dBm RXBOOST %s\n",
                     meshcom_settings.node_aprsmc, meshcom_settings.node_atxt, meshcom_settings.node_name, (bBLElong?"long":"short"), bleTxStats, (bDisplayOff?"off":"on"),
                     getCountry(meshcom_settings.node_country).c_str() , getFreq(), getPower(), (bBOOSTEDGAIN?"on":"off"));
+
+            // BLC-03: BLE link counters (connects, disconnects by class, failed connects, advertising restarts).
+            char bleLinkStats[128];
+            bleStatsFormat(g_bleStats, bleLinkStats, sizeof bleLinkStats);
+            printfdeb("...%s\n", bleLinkStats);
 
             // CS-01: max_hop_text ist persistent und ueber --maxhop setzbar,
             // max_hop_pos bleibt der Compile-Default.
@@ -6380,6 +6487,7 @@ void commandAction(char *umsg_text, bool ble)
                 printlndeb("ETH");
 
             printfdeb("...hasIpAddress: %s\n", (meshcom_settings.node_hasIPaddress?"yes":"no"));
+            printfdeb("...MTU          : %i (MSS %i)\n", meshcom_settings.node_ethmtu, meshcom_settings.node_ethmtu - 40);
             if(meshcom_settings.node_hasIPaddress || meshcom_settings.node_netmode == 1)
             {
                 printfdeb("...IP address   : %s\n", meshcom_settings.node_ip);
@@ -6400,14 +6508,17 @@ void commandAction(char *umsg_text, bool ble)
                     {
                         printfdeb("...GW address   : %s\n", meshcom_settings.node_gw);
                         printfdeb("...DNS address  : %s\n", meshcom_settings.node_dns);
-                        #if defined(BOARD_RAK4630)
-                        printfdeb("...ETH MTU      : %i (MSS %i)\n", meshcom_settings.node_ethmtu, meshcom_settings.node_ethmtu - 40);
-                        #endif
                     }
                 }
     
                 if(!bWIFIAP)
                     printfdeb("...UDP-HBeat : %ld\n", millis() - meshcom_settings.node_last_upd_timer);
+            }
+
+            { // GW-LINK: server path (Internet/Hamnet) and whether it still answers; UDP-HBeat above is the last HB sent
+                char gwl[96];
+                gwLinkFormat(gwl, sizeof(gwl), bGATEWAY, meshcom_settings.node_hasIPaddress, millis());
+                printfdeb("...Server       : %s\n", gwl);
             }
             #endif
     
@@ -6564,13 +6675,8 @@ void commandAction(char *umsg_text, bool ble)
 // sends back gps data to the phone
 void sendGpsJson()
 {
-    double d_lat = meshcom_settings.node_lat;
-    if (meshcom_settings.node_lat_c == 'S')
-        d_lat = meshcom_settings.node_lat * -1.0;
-
-    double d_lon = meshcom_settings.node_lon;
-    if (meshcom_settings.node_lon_c == 'W')
-        d_lon = meshcom_settings.node_lon * -1.0;
+    const double d_lat = nodeSignedLat(meshcom_settings.node_lat, meshcom_settings.node_lat_c);
+    const double d_lon = nodeSignedLon(meshcom_settings.node_lon, meshcom_settings.node_lon_c);
 
     JsonDocument pdoc;
 
@@ -6655,12 +6761,16 @@ void sendNodeSetting()
     nsetdoc["NOALL"] = bNoMSGtoALL;
     nsetdoc["NOPMOTHER"] = (bool)(meshcom_settings.node_sset3 & 0x8000);
     nsetdoc["BLED"] = bUSER_BOARD_LED;
+    nsetdoc["CHGLED"] = bCHARGE_LED;   // CHG-04: true = follows charging, false = dark
     nsetdoc["GWS"] = meshcom_settings.node_gwsrv;
 
     sendBleJsonRegister(nsetdoc); // JSN-01
 
     // second node settings json
-    // {"TYP":"SN1","VIA":true,"VIACALL":"OE1KFR-12","WSPWD":"","ASYM":false}
+    // {"TYP":"SN1","VIA":true,"VIACALL":"OE1KFR-12","WSPWD":"","ASYM":false,"TZ":"CET-1CEST,M3.5.0,M10.5.0/3"}
+    // TZ (TZ-01, up to 39 chars) lives here, not in SN: SN is at 228 of
+    // BLE_JSON_PAYLOAD_MAX 244. Worst case SN1: VIACALL 39 + WSPWD 19 + TZ 39 = 167
+    // JSON bytes. TZ is last, so bleJsonFrameFailSoft() would drop it first.
     JsonDocument nsetdoc1;
 
     nsetdoc1["TYP"] = "SN1";
@@ -6668,6 +6778,7 @@ void sendNodeSetting()
     nsetdoc1["VIACALL"] = meshcom_settings.node_via;
     nsetdoc1["WSPWD"] = meshcom_settings.node_webpwd;
     nsetdoc1["ASYM"] = bGPSAutosymbol;
+    nsetdoc1["TZ"] = meshcom_settings.node_tz;
 
     sendBleJsonRegister(nsetdoc1); // JSN-01
 }

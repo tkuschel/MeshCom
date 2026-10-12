@@ -26,6 +26,8 @@
 #include "regex_functions.h"
 #include "conf_frame.h"
 #include "setlog_lines.h"
+#include "wifi_start_gate.h"
+#include "gw_link_status.h"
 
 #if defined(ESP32)
 #include "esp_task_wdt.h"
@@ -52,6 +54,7 @@ String grc_ids;
 #include "esp_wifi.h"
 #include <ESP32Ping.h>
 #include <Preferences.h>
+#include "esp32/netif_mtu.h"
 
 IPAddress node_ip = IPAddress(0,0,0,0);
 IPAddress node_gw = IPAddress(0,0,0,0);
@@ -380,6 +383,7 @@ static void wifiEventLog(WiFiEvent_t event, WiFiEventInfo_t info)
       s_wifiLastGotIpMs = millis();
       s_wifiGotIpCount++;
       s_wifiGotIpPending = true;
+      netif_mtu::applyConfiguredMtu(meshcom_settings.node_ethmtu); // NMTU-01: TCP-MSS = mtu-40
       Serial.printf("[WIFI];event;got_ip;ms;%lu\n", (unsigned long)millis());
       wifiAssocLog("got_ip", 0);
       break;
@@ -391,6 +395,10 @@ static void wifiEventLog(WiFiEvent_t event, WiFiEventInfo_t info)
       break;
     case ARDUINO_EVENT_WIFI_STA_STOP:
       s_wifiStaUp = false;
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      // NMTU-01: ein Client ist assoziiert, das AP-Netif steht sicher (AP_START waere zu frueh)
+      netif_mtu::applyConfiguredMtu(meshcom_settings.node_ethmtu);
       break;
     default:
       break;
@@ -573,6 +581,8 @@ void wifiDnsPoll()
       printfdeb("[WIFI]...BENCH srvip override -> %s\n", node_hostip.toString().c_str());
     }
     s_node_hostip = node_hostip.toString();
+    if(bench_srvip != IPAddress(0,0,0,0))
+      gwLinkSetDest("bench", s_node_hostip.c_str());   // GW-LINK: show the mock, as nRF52 does (nrf_eth.cpp startUDP)
     Serial.printf("[WIFI];dns;%s;ip;%s;ms;%lu\n", s_dnsSrv.name, s_node_hostip.c_str(), (unsigned long)(millis() - s_dnsSrv.t0));
     if((uint32_t)node_hostip != 0 && hasIPaddress)
       sendMeshComHeartbeat();     // gateway activity (KEEP)
@@ -622,7 +632,7 @@ void wifiDnsPoll()
     return false;
   }
 
-  if(meshcom_settings.node_ssid[0] == 0x00 || is_equ(meshcom_settings.node_ssid, "none"))
+  if(wifiSsidMissingBlocksStart(bWIFIAP, meshcom_settings.node_ssid))
   {
     return false;
   }
@@ -1088,7 +1098,7 @@ void startMeshComUDP()
       const char *ntp_host = NULL;
       IPAddress ntp_literal(0,0,0,0);
 
-      if (node_ip[0] == 44 || meshcom_settings.node_hamnet_only == 1)
+      if ((node_ip[0] == 44 && meshcom_settings.node_hamnet_only == 1) || meshcom_settings.node_hamnet_only == 1)
       {
         // Hamnet only not available for IT-Server, so we use Internet for IT-Server
         if(memcmp(meshcom_settings.node_gwsrv, "IT", 2) == 0)
@@ -1102,6 +1112,20 @@ void startMeshComUDP()
         {
           printlndeb("[WIFI]...Hamnet UDP-DEST meshcom.hamnet.cloud");
           srv_host = "meshcom.hamnet.cloud";
+          srv_path = "hamnet";
+        }
+        else
+        if(memcmp(meshcom_settings.node_gwsrv, "HC", 2) == 0)
+        {
+          printlndeb("[WIFI]...Hamnet UDP-DEST 44.148.230.197");
+          srv_host = "44.148.230.197";
+          srv_path = "hamnet";
+        }
+        else
+        if(memcmp(meshcom_settings.node_gwsrv, "HB", 2) == 0)
+        {
+          printlndeb("[WIFI]...Hamnet UDP-DEST 44.142.42.59");
+          srv_host = "44.142.42.59";
           srv_path = "hamnet";
         }
         else
@@ -1148,6 +1172,20 @@ void startMeshComUDP()
           srv_path = "inet";
         }
         else
+        if(memcmp(meshcom_settings.node_gwsrv, "HC", 2) == 0)
+        {
+          printlndeb("[WIFI]...Internet UDP-DEST meshcom.hamnet.network");
+          srv_host = "meshcom.hamnet.network";
+          srv_path = "inet";
+        }
+        else
+        if(memcmp(meshcom_settings.node_gwsrv, "HB", 2) == 0)
+        {
+          printlndeb("[WIFI]...Internet UDP-DEST meshcom.emcomm.ch");
+          srv_host = "meshcom.emcomm.ch";
+          srv_path = "inet";
+        }
+        else
         {
           printlndeb("[WIFI]...Internet UDP-DEST meshcom.oevsv.at");
           srv_host = "meshcom.oevsv.at";
@@ -1173,6 +1211,7 @@ void startMeshComUDP()
       // host is not chosen yet, so there is nothing to log.
       Serial.printf("[GW];srv;%.2s;host;%s;path;%s;ms;%lu\n",
                      meshcom_settings.node_gwsrv, srv_host, srv_path, (unsigned long)millis());
+      gwLinkSetDest(srv_path, srv_host);
 
       wifiDnsStart(&s_dnsSrv, srv_host);
       if(ntp_host != NULL)

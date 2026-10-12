@@ -24,8 +24,10 @@
 #include "regex_functions.h"
 #include "conf_frame.h"
 #include "setlog_lines.h"
+#include "gw_link_status.h"
 #include "udp_frame.h"
 #include "ack_attribution.h"   // DR-09: buildAckPhoneFrame()
+#include "own_msg_status.h"   // late ACK -> durable web GUI status (ring slot may be gone)
 #include "sto_notice.h"        // F1/stage 4: :sto custody notice on server ingress
 
 // C1/U1 carve of handleUdpFrame_nrf52() out of nrf_eth.cpp; see udp_frame.h
@@ -103,6 +105,7 @@ int handleUdpFrame_nrf52(unsigned char *inc_udp_buffer, int packetSize, IPAddres
         printfdeb("[GATE] Received a LoRa packet to transmit\n");
 
       neth.last_upd_timer = millis();
+      gwLinkNoteRx(millis());   // real server frame (not the OTHER branch)
       hb_warn_logged = false;   // DR-03: Latch nur zusammen mit der Alterung zuruecksetzen
 
       neth.lora_tx_msg_len = packetSize - UDP_MSG_INDICATOR_LEN;
@@ -300,10 +303,12 @@ int handleUdpFrame_nrf52(unsigned char *inc_udp_buffer, int packetSize, IPAddres
                     uint8_t ack_status = 0x01;  // ACK
 
                     int iackcheck = checkOwnTx(msg_counter);
+                    if(iackcheck < 0 && strcmp(destination_call, meshcom_settings.node_call) == 0)
+                        ownMsgStatusSet(msg_counter, 0x02);   // late ACK (a held DM is acked hours later): the ring slot is gone, the durable status row is not
 
                     if(iackcheck >= 0)
                     {
-                        own_msg_id[iackcheck][4] = 0x02;   // 02...ACK
+                        setOwnMsgStatus(iackcheck, 0x02);   // 02...ACK
 
                         // PN-Wiederholung (pn_retry.h): ein :ackNNN ueber den Server stoppt auch
                         // den wartenden Ring-Slot -- das Echo gibt eine eigene PN nicht mehr frei.
@@ -381,7 +386,7 @@ int handleUdpFrame_nrf52(unsigned char *inc_udp_buffer, int packetSize, IPAddres
                        (own_msg_id[iStoCheck][4] == 0x00 || own_msg_id[iStoCheck][4] == 0x01 || own_msg_id[iStoCheck][4] == 0x04) &&
                        stoHolderNote(msg_counter, aprsmsg.msg_source_call, stoNnn, millis()))
                     {
-                        own_msg_id[iStoCheck][4] = 0x04;   // 04...HELD
+                        setOwnMsgStatus(iStoCheck, 0x04);   // 04...HELD
 
                         uint8_t stoPrintBuff[30];
                         uint16_t stoPlen = buildAckPhoneFrame(stoPrintBuff, msg_counter, ACK_STATUS_HELD, aprsmsg.msg_source_call);
@@ -536,6 +541,7 @@ int handleUdpFrame_nrf52(unsigned char *inc_udp_buffer, int packetSize, IPAddres
       Serial.printf("[GW];rx;type;CONF;len;%d;ms;%lu\n", packetSize, (unsigned long)millis());
 
       neth.last_upd_timer = millis();
+      gwLinkNoteRx(millis());   // real server frame (not the OTHER branch)
       hb_warn_logged = false;   // DR-03: Latch nur zusammen mit der Alterung zuruecksetzen
 
       neth.had_initial_udp_conn = true;
@@ -628,6 +634,7 @@ int handleUdpFrame_nrf52(unsigned char *inc_udp_buffer, int packetSize, IPAddres
       Serial.printf("[GW];rx;type;BEAT;len;%d;ms;%lu\n", packetSize, (unsigned long)millis());
 
       neth.last_upd_timer = millis();
+      gwLinkNoteRx(millis());   // real server frame (not the OTHER branch)
       hb_warn_logged = false;   // DR-03: Latch nur zusammen mit der Alterung zuruecksetzen
       
       /**

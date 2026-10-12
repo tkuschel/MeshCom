@@ -9,6 +9,7 @@
 #include <configuration.h>
 #include <debugconf.h>
 #include "web_functions.h"
+#include "esp32/netif_mtu.h" // NMTU-01 (lwIP part ESP32 only)
 #include <loop_functions.h>
 #include <loop_functions_extern.h>
 #include <time.h>
@@ -28,8 +29,10 @@
 #include "nbr_views.h"         // W4b: MHeard/Pfad-Seiten lesen nur noch ueber die Abfrageschicht
 #include <TinyGPSPlus.h>       // DIST auf der MHeard-Seite -- reine distanceBetween()-Rechnung, kein GPS-Modul noetig
 #include "sto_notice.h"        // stage 4: stoHolder() for the messages-page held mark, all boards
+#include "own_msg_status.h" // durable per-message delivery state for the messages-page tick
 #include <url_decode.h>         // #1173: decodeURLPercentCoding() -- full percent-decoding of WebUI parameters
 #include <charset_filter.h>     // #1173: UTF-8-safe cut of the 150-byte web message
+#include "clock.h"              // TZ-01: tzActiveAbbrev() -- flags an unparsable node_tz on the info page
 #if defined(ENABLE_MSGSTORE)
 #include <msgstore_api.h> // stage 3 store node: /?page=mailbox, mboxpurge/mboxdeliver, the setup card
 #endif
@@ -38,6 +41,7 @@
 #include "web_setup.h"
 #include "web_nodefunctioncalls.h"
 #include "web_commonServer.h"
+#include "gw_link_status.h"
 #if defined(BOARD_RAK4630)
 #include "w5100.h"          // #1183: W5100.readSn*/writeSnMSSR for the web socket's MSS
 #endif
@@ -251,6 +255,7 @@ void startWebserver()
         }
     }
 
+    netif_mtu::applyConfiguredMtu(meshcom_settings.node_ethmtu); // NMTU-01: before the first accept
     web_server.begin();
 
 
@@ -1001,7 +1006,9 @@ void deliver_scaffold(bool bget_password)
     // until the operator actually comes back to look at them
     web_client.println("document.addEventListener('visibilitychange',function(){if(cpage=='messages')mcApplyTab();});");
     web_client.println("function mcHistIndex(id){for(var i=0;i<mcHistory.length;i++){if(mcHistory[i].id==id)return i;}return -1;}");
-    web_client.println("function mcMergeEntry(el){var id=el.getAttribute('data-id');var html=el.outerHTML;var dst=el.getAttribute('data-dst')||'';var ts=parseInt(el.getAttribute('data-ts'))||0;var rx=el.classList.contains('message-received');var idx=mcHistIndex(id);if(idx<0){mcHistory.push({id:id,html:html,dst:dst,ts:ts,rx:rx});mcSeen[id]=true;if(mcHistory.length>MC_HIST_MAX){var dropped=mcHistory.shift();delete mcSeen[dropped.id];}}else{mcHistory[idx].html=html;mcHistory[idx].dst=dst;mcHistory[idx].ts=ts;mcHistory[idx].rx=rx;}}");
+    // a tick is rank-monotone: the server's status ring is shared and churned and drops the tick of an old message, so a ranked-higher tick of the remembered entry survives (rank = index 0,1,4,3,2: heard < held < failed < ACK)
+    web_client.println("function mcTickKeep(h,el){if(!el.classList.contains('message-send'))return;var t=document.createElement('template');t.innerHTML=h;var o=t.content.querySelector('.mctick');if(!o)return;var n=el.querySelector('.mctick');var R=[0,1,4,3,2];if(n&&R[n.getAttribute('data-st')]>=R[o.getAttribute('data-st')])return;if(n)n.replaceWith(o);else{var p=el.querySelector('p');if(p)p.insertBefore(o,p.firstChild);}}");
+    web_client.println("function mcMergeEntry(el){var id=el.getAttribute('data-id');var idx=mcHistIndex(id);if(idx>=0)mcTickKeep(mcHistory[idx].html,el);var html=el.outerHTML;var dst=el.getAttribute('data-dst')||'';var ts=parseInt(el.getAttribute('data-ts'))||0;var rx=el.classList.contains('message-received');if(idx<0){mcHistory.push({id:id,html:html,dst:dst,ts:ts,rx:rx});mcSeen[id]=true;if(mcHistory.length>MC_HIST_MAX){var dropped=mcHistory.shift();delete mcSeen[dropped.id];}}else{mcHistory[idx].html=html;mcHistory[idx].dst=dst;mcHistory[idx].ts=ts;mcHistory[idx].rx=rx;}}");
     web_client.println("function mcRemovePlaceholder(panel){var kids=panel.children;for(var i=kids.length-1;i>=0;i--){if(kids[i].tagName=='P')panel.removeChild(kids[i]);}}");
     // this function is an ayncronous loader that is used to update the received messages without re-loading the whole page, it will re-call itself after a timeout as long as the message-page is displayed
     // it merges the response into mcHistory/mcSeen instead of overwriting the panel outright, so a message already on screen keeps its DOM position when only its ack mark changed
@@ -1112,14 +1119,15 @@ void deliver_scaffold(bool bget_password)
     web_client.println("<style>\n");
 
     // basic definitions
-    web_client.println(":root {--mcbg:#FFFFFF;--mcgray:#252323;--mcred:#A2182F;--mclightred:#FCEDF0;--mcmidred:#FFA5B4;--mclightblue:#CADFEA;--mclightgreen:#CBFBD4;--widthfactor:1.0;}\n");
-    web_client.println("@media screen and (max-width:600px) {* {font-size:12px;} :root{--widthfactor:0.7;}}\n");
-    web_client.println("@media screen and (min-width:601px) {* {font-size:14px;} :root{--widthfactor:0.7;}}\n");
-    web_client.println("@media screen and (min-width:801px) {* {font-size:14px;} :root{--widthfactor:1.0;}}\n");
-    web_client.println("body {background:var(--mcbg);padding:0px;margin:0px 0px;height:100%;width:100%;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;color:var(--mcgray);font-family:sans-serif;}\n");
-    web_client.println(".font-small {font-size:x-small;}\n");
-    web_client.println(".font-large {font-size:large;}\n");
-    web_client.println(".font-xlarge {font-size:x-large;}\n");
+    web_client.println(":root {--fs-s:.85rem;--fs-m:1rem;--fs-l:1.25rem;--fs-xl:1.6rem;--mcbg:#FFFFFF;--mcgray:#252323;--mcred:#A2182F;--mclightred:#FCEDF0;--mcmidred:#FFA5B4;--mclightblue:#CADFEA;--mclightgreen:#CBFBD4;--widthfactor:1.0;}\n");
+    web_client.println("@media screen and (max-width:600px) {html {font-size:12px;} :root{--widthfactor:0.7;}}\n");
+    web_client.println("@media screen and (min-width:601px) {html {font-size:14px;} :root{--widthfactor:0.7;}}\n");
+    web_client.println("@media screen and (min-width:801px) {html {font-size:14px;} :root{--widthfactor:1.0;}}\n");
+    web_client.println("h1,h2,h3,h4,h5,h6,small,code,pre,kbd,samp,button,input,select,textarea {font-size:inherit;}\n");
+    web_client.println("body {font-size:var(--fs-m);background:var(--mcbg);padding:0px;margin:0px 0px;height:100%;width:100%;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;color:var(--mcgray);font-family:sans-serif;}\n");
+    web_client.println(".font-small {font-size:var(--fs-s);}\n");
+    web_client.println(".font-large {font-size:var(--fs-l);}\n");
+    web_client.println(".font-xlarge {font-size:var(--fs-xl);}\n");
     web_client.println(".font-bold {font-weight:bold;}\n");
     web_client.println(".no-wrap {white-space:nowrap;}\n");
     web_client.println(".mw-600 {max-width:600px;}");
@@ -1194,7 +1202,7 @@ void deliver_scaffold(bool bget_password)
     web_client.println(".collapsablecard>.cardtoggle>i {padding:4px;margin:auto;border:solid black;border-width:2px 0 0 2px;display:block;-webkit-transform:rotate(-135deg);transform:rotate(-135deg);-webkit-transition:0.5s;transition:0.5s;}\n");
     web_client.println(".cardopen>.cardtoggle>i {-webkit-transform: rotate(45deg);transform: rotate(45deg);}\n");
     web_client.println(".collapsablecard>div {max-height:0px;-webkit-transition:opacity .15s .0s,max-height .25s .10s;transition:opacity .15s .0s,max-height .25s .10s,margin .0s .50s;	opacity:0.0;overflow:hidden;margin:0px;}\n");
-    web_client.println(".cardopen>div {-webkit-transition:opacity .15s .10s,max-height .25s .0s;transition:opacity .15s .10s,max-height .25s .0s;max-height:1000px;opacity:1;margin:7px;}\n");
+    web_client.println(".cardopen>div {-webkit-transition:opacity .15s .10s,max-height .25s .0s;transition:opacity .15s .10s,max-height .25s .0s;max-height:none;opacity:1;margin:7px;}\n");
     web_client.println(".cardopen>span:first-of-type {display:none;}\n");
 
     // content definitions -> WQ-01 LoRa Queue panel (rxlog page)
@@ -1205,8 +1213,8 @@ void deliver_scaffold(bool bget_password)
     web_client.println(".mcq-cell-empty {flex:1;height:14px;background:#ECECEC;border:1px solid #d0d0d0;box-sizing:border-box;}\n");
     web_client.println(".mcq-tick {position:absolute;top:0;bottom:0;width:1px;background:#000;opacity:0.5;}\n");
     web_client.println(".mcq-tick-faint {position:absolute;top:0;bottom:0;width:1px;background:#000;opacity:0.15;}\n");
-    web_client.println(".mcq-ticklabels {position:relative;height:12px;font-size:x-small;margin:0 0 8px 0;}\n");
-    web_client.println(".mcq-legend {font-size:x-small;margin:0 0 8px 0;}\n");
+    web_client.println(".mcq-ticklabels {position:relative;height:12px;font-size:var(--fs-s);margin:0 0 8px 0;}\n");
+    web_client.println(".mcq-legend {font-size:var(--fs-s);margin:0 0 8px 0;}\n");
     web_client.println(".mcq-swatch {display:inline-block;width:8px;height:8px;margin:0 3px 0 6px;border-radius:2px;vertical-align:middle;}\n");
     web_client.println(".mcq-util-row {display:flex;align-items:center;gap:6px;margin:2px 0;}\n");
     web_client.println(".mcq-util-label {display:inline-block;min-width:60px;}\n");
@@ -1217,9 +1225,10 @@ void deliver_scaffold(bool bget_password)
     web_client.println("#content_inner .mctab {display:inline-flex;align-items:center;border:solid 1px var(--mcgray);background-color:var(--mcbg);border-radius:5px;padding:2px 8px;margin-right:4px;cursor:pointer;}\n");
     web_client.println("#content_inner .mctab-new {background-color:var(--mclightgreen);}\n");
     web_client.println("#content_inner .mctab-on {background-color:var(--mclightblue);}\n");
-    web_client.println(".mcbadge {font-size:x-small;font-weight:bold;margin-left:4px;}\n");
+    web_client.println(".mcbadge {font-size:var(--fs-s);font-weight:bold;margin-left:4px;}\n");
 
     // stage 3 mailbox card below: "before you switch this on" warning box.
+    web_client.println(".cardbody>.grid,.cardbody>.mbx-warn {margin:0 0 7px 0;}\n"); // Store node card: sub-grids inside the single collapsible body
     web_client.println(".mbx-warn {background:var(--mclightred);border:solid 1px var(--mcred);border-radius:5px;padding:6px 8px;margin:7px;}\n");
 
     // content definitions -> mailbox page (stage 3, docs/design/mailbox-page-mockup.html).
@@ -1230,7 +1239,7 @@ void deliver_scaffold(bool bget_password)
     web_client.println(".mbx-counters {display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:6px 10px;margin:7px;font-variant-numeric:tabular-nums;}\n");
     web_client.println(".mbx-counters>div {display:flex;justify-content:space-between;gap:6px;border-bottom:1px dotted #c8c8c8;padding:2px 0;}\n");
     web_client.println(".mbx-counters b {font-weight:bold;}\n");
-    web_client.println(".mbx-state {display:inline-block;border:solid 1px var(--mcgray);border-radius:5px;padding:0 6px;font-size:x-small;font-weight:bold;white-space:nowrap;}\n");
+    web_client.println(".mbx-state {display:inline-block;border:solid 1px var(--mcgray);border-radius:5px;padding:0 6px;font-size:var(--fs-s);font-weight:bold;white-space:nowrap;}\n");
     web_client.println(".mbx-held {background:var(--mclightblue);}\n");
     web_client.println(".mbx-armed, .mbx-ladder {background:var(--mclightgreen);}\n");
     web_client.println(".mbx-cooldown {background:#F6E7B8;}\n");
@@ -1238,7 +1247,7 @@ void deliver_scaffold(bool bget_password)
     web_client.println(".mbx-actions {display:flex;gap:6px;white-space:nowrap;}\n");
     web_client.println(".mbx-toolbar {display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 10px 0;}\n");
     web_client.println(".mbx-toolbar .spacer {flex:1;}\n");
-    web_client.println(".mbx-legend {font-size:x-small;margin:8px 0 0 0;color:#555;}\n");
+    web_client.println(".mbx-legend {font-size:var(--fs-s);margin:8px 0 0 0;color:#555;}\n");
     web_client.println(".mbx-legend .mbx-state {margin-right:8px;}\n");
 
     web_client.println("</style>\n\n");
@@ -1376,6 +1385,25 @@ static String htmlEscape(const String &input)
     return out;
 }
 
+// percent-encode a value for use inside a URL query string (RFC 3986 unreserved set stays as is)
+static String urlEncode(const char *input)
+{
+    String out;
+    for (; input && *input; input++)
+    {
+        unsigned char c = (unsigned char)*input;
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_' || c == '~')
+            out += (char)c;
+        else
+        {
+            char pct[4];
+            snprintf(pct, sizeof(pct), "%%%02X", c);
+            out += pct;
+        }
+    }
+    return out;
+}
+
 /**
  * ###########################################################################################################################
  * resolves the NTP server the node actually uses (WEB-01): own override if set, else the same
@@ -1459,7 +1487,13 @@ void sub_page_rxlog()
             // title, normal (log lines, panel text), small (legend, notes, tick labels).
             // Empty slots (calloc'd, never written) are skipped.
             if (ringbufferRAWLoraRX[iRead][0] != 0x00)
-                web_client.printf("<p class=\"no-wrap\"><%i>%s</p>\n", iRead, ringbufferRAWLoraRX[iRead]);
+            {
+                // over-the-air text: escape. print() pieces, not printf: the escaped line can
+                // reach several hundred bytes and Print::printf mallocs above 64 B.
+                web_client.printf("<p class=\"no-wrap\"><%i>", iRead);
+                web_client.print(htmlEscape(String((const char *)ringbufferRAWLoraRX[iRead])));
+                web_client.print("</p>\n");
+            }
             iRead = increment_mod(iRead, MAX_LOG);
         } while (RAWLoRaWrite != iRead);
     }
@@ -1571,7 +1605,7 @@ void sub_page_mheard()
     web_client.println("<div id=\"content_inner\">");
     // W4d: Legende fuer die zweite Kaertchenzeile (title= wirkt auf dem
     // Telefon nicht, deshalb als Text).
-    web_client.print("<p style=\"font-size:0.85em;color:#555;max-width:900px;\">"
+    web_client.print("<p style=\"font-size:var(--fs-s);color:#555;max-width:900px;\">"
                      "Stations I heard directly in the last 3 h, newest first. "
                      "Last heard: minutes since I last received it directly. "
                      "Hears me: its own reports say it hears me, at this SNR. "
@@ -1599,7 +1633,7 @@ void sub_page_mheard()
             continue;
 
         web_client.printf("<div class=\"cardlayout\" style=\"max-width:900px;\">\n");
-        web_client.printf("<label class=\"cardlabel\"><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a> <span class=\"font-small\">(", v.call, v.call);
+        web_client.printf("<label class=\"cardlabel\"><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a> <span class=\"font-small\">(", urlEncode(v.call).c_str(), htmlEscape(String(v.call)).c_str());
         if (bClockValid)
         {
             // Sekunde aus dem Slot statt der Zeilenminute (Konzept 4.6);
@@ -1724,7 +1758,7 @@ static void nbrPrintCall(uint8_t row)
 {
     NbrRowView v;
     if (nbrRowGet(nbrMatrix, row, &v))
-        web_client.print(v.call);
+        web_client.print(htmlEscape(String(v.call)));
     else
         web_client.print("?");
 }
@@ -1848,7 +1882,7 @@ void sub_page_path()
 
         if (pr.kind == 0)
         { // eigene Zeile: dieselben Spaltenregeln wie eine direkte Zeile, ohne Hears me/Via
-            web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", r0.call, r0.call);
+            web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", urlEncode(r0.call).c_str(), htmlEscape(String(r0.call)).c_str());
             web_client.print("<td>0</td>");
             web_client.printf("<td>%s</td>", (r0.flags & NBR_FLAG_GW) ? "Y" : "N");
             if (!(r0.flags & NBR_FLAG_POS))
@@ -1880,7 +1914,7 @@ void sub_page_path()
             if (!nbrRowGet(nbrMatrix, X, &v))
                 continue; // Zeile ist zwischen Sammel- und Renderdurchlauf verschwunden (EVICT)
 
-            web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", v.call, v.call);
+            web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", urlEncode(v.call).c_str(), htmlEscape(String(v.call)).c_str());
             web_client.print("<td>1</td>");
             web_client.printf("<td>%s</td>", (v.flags & NBR_FLAG_GW) ? "Y" : "N");
             if (!(v.flags & NBR_FLAG_POS))
@@ -1938,7 +1972,7 @@ void sub_page_path()
         NbrRowView rv;
         uint8_t rowFlags = hasRow && nbrRowGet(nbrMatrix, r.row, &rv) ? rv.flags : 0;
 
-        web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", r.call, r.call);
+        web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", urlEncode(r.call).c_str(), htmlEscape(String(r.call)).c_str());
         web_client.printf("<td>%u</td>", (unsigned)r.hops);
         web_client.printf("<td>%s</td>", hasRow ? ((rowFlags & NBR_FLAG_GW) ? "Y" : "N") : (r.gw ? "Y" : "N"));
 
@@ -1969,7 +2003,7 @@ void sub_page_path()
 
                 if (r.is_row)
                 { // 2-Hop-Zeile: entry IST schon die B-Menge (die direkten Nachbarn)
-                    web_client.printf("%s%s", first ? "" : ", ", acall);
+                    web_client.printf("%s%s", first ? "" : ", ", htmlEscape(String(acall)).c_str());
                     first = false;
                     continue;
                 }
@@ -1979,7 +2013,7 @@ void sub_page_path()
                 NbrMask viaB = nbrMaskAnd(nbrHearersMask(nbrMatrix, a, now_min), directMask);
                 if (nbrMaskEmpty(viaB))
                 {
-                    web_client.printf("%s%s", first ? "" : ", ", acall);
+                    web_client.printf("%s%s", first ? "" : ", ", htmlEscape(String(acall)).c_str());
                     first = false;
                     continue;
                 }
@@ -1987,7 +2021,7 @@ void sub_page_path()
                 {
                     NbrRowView bv;
                     const char *bcall = nbrRowGet(nbrMatrix, b, &bv) ? bv.call : "?";
-                    web_client.printf("%s%s&gt;%s", first ? "" : ", ", acall, bcall);
+                    web_client.printf("%s%s&gt;%s", first ? "" : ", ", htmlEscape(String(acall)).c_str(), htmlEscape(String(bcall)).c_str());
                     first = false;
                 }
             }
@@ -2017,7 +2051,7 @@ void sub_page_path()
 
     // Legende, wie bei sub_page_neighbours() unten: title= wirkt auf dem
     // Telefon nicht, deshalb stehen dieselben Erklaerungen hier als Text.
-    web_client.print("<p style=\"font-size:0.85em;color:#555;\">"
+    web_client.print("<p style=\"font-size:var(--fs-s);color:#555;\">"
                       "Hops: 0 = me, 1 = direct neighbour, 2+ = reached via other nodes."
                       " | Hears me: SNR at which that neighbour last reported hearing me, '-' if unknown or not a direct/2-hop row."
                       " | Via: the entry path this station was heard on (2-hop: the direct neighbour it is via; horizon: the entry row, and beyond it if cheap to show)."
@@ -2468,7 +2502,7 @@ void sub_page_neighbours()
     // Legende (6.1, Kopf): title= wirkt auf dem Telefon nicht, deshalb
     // stehen dieselben Erklaerungen hier zusaetzlich als Text (W4c: Cov dazu,
     // die "Covered by"-Spalte der geloeschten Zeilentabelle).
-    web_client.print("<p style=\"font-size:0.85em;color:#555;\">"
+    web_client.print("<p style=\"font-size:var(--fs-s);color:#555;\">"
                       "D/I: Direct: heard by me over the air. Indirect: only via a neighbour."
                       " | G: Gateway: a HEY addressed to HG was seen from this node. 'no' means not observed."
                       " | M: Mesh: relays foreign frames, from its last position frame."
@@ -2713,12 +2747,12 @@ void sub_page_mailbox()
         default: state_class = ""; break;
         }
 
-        web_client.printf("<tr><td class=\"font-bold no-wrap\">%s</td>", e->dst);
+        web_client.printf("<tr><td class=\"font-bold no-wrap\">%s</td>", htmlEscape(String(e->dst)).c_str());
         if (stale)
             web_client.printf("<td class=\"no-wrap mbx-stale\" title=\"Older than the store set window\">%s</td>", buf_heard);
         else
             web_client.printf("<td class=\"no-wrap\">%s</td>", buf_heard);
-        web_client.printf("<td class=\"no-wrap\">%s</td>", e->src);
+        web_client.printf("<td class=\"no-wrap\">%s</td>", htmlEscape(String(e->src)).c_str());
         web_client.printf("<td class=\"num\">%03u</td>", (unsigned)e->nnn);
         web_client.printf("<td class=\"num\">%u B</td>", (unsigned)e->plen);
         web_client.printf("<td class=\"no-wrap\">%s</td>", buf_age);
@@ -2735,11 +2769,12 @@ void sub_page_mailbox()
         }
         else
         {
-            web_client.printf("<button type=\"button\" onclick=\"if(confirm('Start a delivery ladder now for %s to %s (NNN %03u)? Ignores the cooldown, still subject to the node caps.')){callfunction('mboxdeliver','%d');}\">Deliver</button>",
-                               e->src, e->dst, (unsigned)e->nnn, slot);
+            // callsigns travel in HTML-escaped data attributes and are read back via the DOM, never spliced into a JS string
+            web_client.printf("<button type=\"button\" data-src=\"%s\" data-dst=\"%s\" onclick=\"if(confirm('Start a delivery ladder now for '+this.dataset.src+' to '+this.dataset.dst+' (NNN %03u)? Ignores the cooldown, still subject to the node caps.')){callfunction('mboxdeliver','%d');}\">Deliver</button>",
+                               htmlEscape(String(e->src)).c_str(), htmlEscape(String(e->dst)).c_str(), (unsigned)e->nnn, slot);
         }
-        web_client.printf("<button type=\"button\" onclick=\"if(confirm('Purge the message for %s from %s (NNN %03u)?')){callfunction('mboxpurge','%d');}\">Purge</button>",
-                           e->dst, e->src, (unsigned)e->nnn, slot);
+        web_client.printf("<button type=\"button\" data-src=\"%s\" data-dst=\"%s\" onclick=\"if(confirm('Purge the message for '+this.dataset.dst+' from '+this.dataset.src+' (NNN %03u)?')){callfunction('mboxpurge','%d');}\">Purge</button>",
+                           htmlEscape(String(e->src)).c_str(), htmlEscape(String(e->dst)).c_str(), (unsigned)e->nnn, slot);
         web_client.println("</td></tr>");
     }
 
@@ -2788,8 +2823,10 @@ void sub_page_setup()
     web_client.println("<div id=\"content_inner\">");
 
     // Manual Command Section
-    web_client.println("<div class=\"cardlayout\">\n");
+    web_client.println("<div class=\"cardlayout collapsablecard\">\n");
     web_client.println("<label class=\"cardlabel\">Manual Command</label>\n");
+    web_client.println("<span>Open this to send a manual command.</span>\n");
+    web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
     web_client.println("<div class=\"grid\">");
     web_client.println("<span>Enter manual command:</span>");
     web_client.println("<input type=\"text\" id=\"manualcommand\" maxlength=\"40\" size=\"20\" style=\"width:100%\">");
@@ -2817,7 +2854,7 @@ void sub_page_setup()
     web_client.println("</select>");
     web_client.println("<button onclick=\"setvalue('setctry', document.getElementById('country').value,false)\"><i class=\"btncheckmark\"></i></button>");
 
-    _create_setup_textinput_element("txpower", "TX Power", String(meshcom_settings.node_power), "15", "txpower", 2, false, false);                    // create Textinput-Element including Label and Button
+    _create_setup_numberinput_element("txpower", "TX Power", meshcom_settings.node_power, (int)TX_POWER_MIN, (int)TX_POWER_MAX, "txpower"); // D10: number input with the board range
 
     // CS-02: Max-Hop als Drop-down. Angeboten werden 4/3/2; hat --maxhop einen
     // Wert ausserhalb dieser Liste gesetzt (1, 5, 6), steht er zusaetzlich drin,
@@ -2838,6 +2875,11 @@ void sub_page_setup()
     }
 
     _create_setup_textinput_element("utcoffset", "UTC Offset", String(meshcom_settings.node_utcoff, 1).c_str(), "1.0", "utcoffset", 4, false, false); // create Textinput-Element including Label and Button
+    // TZ-01: a set POSIX TZ rule overrides the fixed offset above; the offset then shows the derived value
+    // node_tz is HTML-escaped: tzParse() accepts any alnum name inside <...>
+    // (e.g. "<plaintext>-1"), and a config import does not run tzParse() at all.
+    _create_setup_textinput_element("tz", "Timezone (POSIX TZ)", String(meshcom_settings.node_tz), "CET-1CEST,M3.5.0,M10.5.0/3", "tz", 39, false, false);
+    web_client.println("<p class=\"font-small\" style=\"grid-column:1/-1\">A set POSIX TZ rule overrides the fixed UTC offset (DST handled automatically); the UTC offset field then shows the derived value. Empty or &quot;none&quot; = fixed offset only.</p>");
     _create_setup_textinput_element("maxv", "max. Voltage", String(meshcom_settings.node_maxv, 3), "4.125", "maxv", 5, false, false);                 // create Textinput-Element including Label and Button
 
     web_client.println("</div><div class=\"grid grid2\">");
@@ -2859,6 +2901,30 @@ void sub_page_setup()
 
     web_client.println("</div></div>");
 
+    // NMTU-01 / #1190: MTU card, collapsible like every other card (UI-04 / D5), all boards. Applies on change through
+    // setparam mtu (--mtu, read-back node_ethmtu); the MSS shown is MTU - 40. A stored value outside the
+    // three presets (console --mtu 1350) gets its own selected "custom" option so the page never lies.
+    {
+        const int mtu_cur = meshcom_settings.node_ethmtu;
+        const bool mtu_preset = (mtu_cur == 1280 || mtu_cur == 1400 || mtu_cur == 1500);
+        web_client.println("<div class=\"cardlayout collapsablecard\">");
+        web_client.println("<label class=\"cardlabel\">MTU</label>");
+        web_client.println("<span>Open this for the Ethernet MTU.</span>\n");
+        web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
+        web_client.println("<div class=\"grid grid3\">");
+        web_client.println("<label for=\"mtu\">MTU</label>");
+        web_client.println("<select id=\"mtu\" name=\"mtu\" onchange=\"document.getElementById('mtu_mss').textContent='MSS '+(parseInt(this.value)-40);setvalue('mtu',this.value,true);\">");
+        web_client.printf("\t<option value=\"1280\" %s>1280 (HAMNET / VPN, default)</option>\n", (mtu_cur == 1280) ? "selected" : "");
+        web_client.printf("\t<option value=\"1400\" %s>1400</option>\n", (mtu_cur == 1400) ? "selected" : "");
+        web_client.printf("\t<option value=\"1500\" %s>1500 (plain LAN)</option>\n", (mtu_cur == 1500) ? "selected" : "");
+        if (!mtu_preset)
+            web_client.printf("\t<option value=\"%i\" selected>custom (%i)</option>\n", mtu_cur, mtu_cur);
+        web_client.println("</select>");
+        web_client.printf("<span id=\"mtu_mss\">MSS %i</span>\n", mtu_cur - 40);
+        web_client.println("</div>");
+        web_client.println("</div>");
+    }
+
     // IP Network Settings Section
     web_client.println("<div class=\"cardlayout collapsablecard\">");
     web_client.println("<label class=\"cardlabel\">IP Network Settings</label>");
@@ -2876,9 +2942,6 @@ void sub_page_setup()
     _create_setup_textinput_element("owngw", "Gateway", String(meshcom_settings.node_gw), "192.168.2.1", "setowngw", 50, false, true);           // create Textinput-Element including Label and Button
     _create_setup_textinput_element("owndns", "DNS", String(meshcom_settings.node_dns), "192.168.2.1", "setowndns", 50, false, true);             // create Textinput-Element including Label and Button
     _create_setup_textinput_element("ownntp", "NTP", String(meshcom_settings.node_ownntp), "192.168.2.1", "setownntp", 50, false, true);          // create Textinput-Element including Label and Button
-    #if defined(BOARD_RAK4630)
-    _create_setup_textinput_element("ethmtu", "ETH MTU", String(meshcom_settings.node_ethmtu), "1500", "ethmtu", 4, false, false);                 // #1183: 1280..1500, applies to the next web connection, no reboot
-    #endif
 
     _create_setup_textinput_element("extudp", "ext. UDP IP", String(meshcom_settings.node_extern), "192.168.100.100", "extudpip", 50, false, false); // create Textinput-Element including Label and Button
 
@@ -3044,8 +3107,11 @@ void sub_page_setup()
     // four states and switching away from "off" must confirm() first and revert the select on
     // cancel -- a plain on/off switch can't carry that. storecall/storetime/storeslots are
     // ordinary text settings and do fit _create_setup_textinput_element.
-    web_client.println("<div class=\"cardlayout\">");
+    web_client.println("<div class=\"cardlayout collapsablecard\">");
     web_client.println("<label class=\"cardlabel\">Store node</label>");
+    web_client.println("<span>Open this for the message store node settings.</span>\n");
+    web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
+    web_client.println("<div class=\"cardbody\">"); // one body div: the sub-grids below live inside it
     web_client.println("<div class=\"grid grid2\">");
     {
         static const char *s_storemode_val[4] = {"off", "own", "list", "heard"};
@@ -3070,6 +3136,7 @@ void sub_page_setup()
     web_client.println("</div>");
     web_client.printf("<div class=\"mbx-warn\"><b>Before you switch this on.</b> This node must run 24/7 on continuous power. Stored messages live in RAM only; a reboot discards all of them without notice, and nobody is told. About %.1f kB of RAM is reserved for %u slots.</div>\n",
                        (float)(msgstoreSlots() * sizeof(struct MsgStoreEntry)) / 1024.0f, (unsigned)msgstoreSlots());
+    web_client.println("</div>"); // cardbody
     web_client.println("</div>");
 #endif
 
@@ -3147,32 +3214,6 @@ void sub_content_messages()
             strftime(timestamp, 20, "%Y-%m-%d %H:%M:%S", oldt);
             struct aprsMessage aprsmsg;
             uint8_t msg_type_b_lora = decodeAPRS(toPhoneBuff, blelen, aprsmsg); // print which message type we got
-            int icheck = checkOwnTx(aprsmsg.msg_id);
-
-            if (icheck >= 0)
-            {
-                if (own_msg_id[icheck][4] == 1)
-                { // 00...not heard, 01...heard, 02...ACK, 03...failed, 04...held
-                    ccheck = "&#x2713&nbsp;";
-                }
-
-                if (own_msg_id[icheck][4] == 2)
-                { // 00...not heard, 01...heard, 02...ACK, 03...failed, 04...held
-                    ccheck = "&#x2611;&nbsp;";
-                }
-
-                if (own_msg_id[icheck][4] == 3)
-                { // 00...not heard, 01...heard, 02...ACK, 03...failed, 04...held (retransmit gave up on a user-originated DM)
-                    ccheck = "<span title=\"delivery failed\">&#x2717;</span>&nbsp;";
-                }
-
-                if (own_msg_id[icheck][4] == 4)
-                { // 00...not heard, 01...heard, 02...ACK, 03...failed, 04...held (a store node holds this DM for an absent destination)
-                    String holder = stoHolder(aprsmsg.msg_id);
-                    String holdtitle = holder.length() > 0 ? ("held by " + htmlEscape(holder)) : "held by a store node";
-                    ccheck = "<span title=\"" + holdtitle + "\">&#x2709;</span>&nbsp;";
-                }
-            }
 
             // Textmessage
             if (msg_type_b_lora == 0x3A)
@@ -3198,6 +3239,34 @@ void sub_content_messages()
                     if (is_equ(meshcom_settings.node_call, aprsmsg.msg_source_call))
                     {
                         String dst_esc = htmlEscape(aprsmsg.msg_destination_call);
+
+                        // The tick comes from the durable own-text status table first: own_msg_id is a
+                        // 20-slot ring shared with every own frame (positions, acks, gateway forwards)
+                        // and loses the status within the hour. checkOwnTx stays as the fallback for
+                        // ids the table does not know (sent before boot of this image / not registered).
+                        // docs/webgui-ack-ticks-verdict-20261004.md, Finding 1.
+                        int tickst = ownMsgStatusGet(aprsmsg.msg_id);
+                        if (tickst < 0)
+                        {
+                            int icheck = checkOwnTx(aprsmsg.msg_id);
+                            if (icheck >= 0)
+                                tickst = own_msg_id[icheck][4];
+                        }
+
+                        // 00...not heard, 01...heard, 02...ACK, 03...failed (retransmit gave up on a user-originated DM), 04...held (a store node holds this DM)
+                        // The span is machine-readable (data-st) so the browser can keep a tick the server no longer knows (mcTickKeep).
+                        if (tickst == 1)
+                            ccheck = "<span class=\"mctick\" data-st=\"1\">&#x2713;&nbsp;</span>";
+                        else if (tickst == 2)
+                            ccheck = "<span class=\"mctick\" data-st=\"2\">&#x2611;&nbsp;</span>";
+                        else if (tickst == 3)
+                            ccheck = "<span class=\"mctick\" data-st=\"3\" title=\"delivery failed\">&#x2717;&nbsp;</span>";
+                        else if (tickst == 4)
+                        {
+                            String holder = stoHolder(aprsmsg.msg_id);
+                            String holdtitle = holder.length() > 0 ? ("held by " + htmlEscape(holder)) : "held by a store node";
+                            ccheck = "<span class=\"mctick\" data-st=\"4\" title=\"" + holdtitle + "\">&#x2709;&nbsp;</span>";
+                        }
 
                         web_client.printf("<div class=\"message message-send\" data-id=\"%u\" data-dst=\"%s\" data-ts=\"%lu\"><div>", aprsmsg.msg_id, dst_esc.c_str(), unix_time);
 
@@ -3230,7 +3299,8 @@ void sub_content_messages()
 
                         web_client.printf("<div class=\"message message-received\" data-id=\"%u\" data-dst=\"%s\" data-ts=\"%lu\"><div>", aprsmsg.msg_id, dst_esc.c_str(), unix_time);
 
-                        web_client.printf("<p class=\"font-small font-bold\">%s", ccheck.c_str());
+                        // no delivery tick on received frames: a gateway keeps server-forwarded foreign frames in own_msg_id and they showed a false tick (Finding 2)
+                        web_client.printf("<p class=\"font-small font-bold\">");
                         web_client.printf("<a target=\"_blank\" href=\"https://aprs.fi/?call=%s\">%s</a>", msg_source_path_esc.c_str(), msg_source_path_esc.c_str());
                         web_client.printf("%s%s</p>", (char *)">", msg_destination_path_esc.c_str());
 
@@ -3304,12 +3374,12 @@ void sub_page_spectrum()
     else
     #endif
     {
-        web_client.printf("<svg viewbox=\"0, 0, %d, %d\" id=\"spectrum_display\">", end_x + 40, end_y + 60);
+        web_client.printf("<svg viewbox=\"0, 0, %d, %d\" id=\"spectrum_display\" style=\"font-size:var(--fs-s);\">", end_x + 40, end_y + 60);
 
         web_client.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" style=\"stroke:black;stroke-width:1\"/>\n", start_x, end_y, end_x, end_y);                    // X-Line at bottom
         web_client.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" style=\"stroke:black;stroke-width:1\"/>\n", start_x, start_y, start_x, end_y);                // Y-Line at left
-        web_client.printf("<text x=\"%d\" y=\"%d\" style=\"font-size: 12px; color: black;\">Freq [MHz]</text>\n", start_x, end_y + 40);                                // caption for X-Line (frequency)
-        web_client.printf("<text x=\"0\" y=\"0\" f style=\"font-size: 12px; color: black;\" transform=\"translate(10, %d) rotate(-90)\")>RSSI [dBm]</text>\n", end_y); // caption for Y-Line (power bins)
+        web_client.printf("<text x=\"%d\" y=\"%d\" style=\"color: black;\">Freq [MHz]</text>\n", start_x, end_y + 40);                                // caption for X-Line (frequency)
+        web_client.printf("<text x=\"0\" y=\"0\" f style=\"color: black;\" transform=\"translate(10, %d) rotate(-90)\")>RSSI [dBm]</text>\n", end_y); // caption for Y-Line (power bins)
 
         web_client.printf("<rect width=\"%d\" height=\"%d\" x=\"%d\" y=\"%d\" fill=\"rgba(0, 110, 129, 0.2)\" />", own_freq_marker_width, end_y - start_y, own_freq_marker_start, start_y); // mark the frequency we are on
         web_client.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" style=\"stroke:rgba(114, 0, 129, 0.2); stroke-width:1\"/>\n", own_freq_marker_center, start_y, own_freq_marker_center, end_y);
@@ -3320,7 +3390,7 @@ void sub_page_spectrum()
             if (i % 3 == 0)
             {                                                                                                                                                                                                            // print frequency value every 3 steps
                 web_client.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" style=\"stroke:grey; stroke-width:1\"/>\n", start_x - 10, start_y + (i * step_pixel_height), end_x, start_y + (i * step_pixel_height)); // axis lines for Y axis
-                web_client.printf("<text x=\"%d\" y=\"%d\" style=\"font-size: 12px; color: black;\">-%d</text>\n", start_x - 40, start_y + (i * step_pixel_height) + 6, 11 + (i * 4));                                   // axis title for Y-axis (power)
+                web_client.printf("<text x=\"%d\" y=\"%d\" style=\"color: black;\">-%d</text>\n", start_x - 40, start_y + (i * step_pixel_height) + 6, 11 + (i * 4));                                   // axis title for Y-axis (power)
             }
         }
 
@@ -3343,7 +3413,7 @@ void sub_page_spectrum()
             if (current_fStep % 5 == 0)                                                                                                                                                                                                      // draw axis line every 5 steps
                 web_client.printf("<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" style=\"stroke:grey; stroke-width:1\"/>\n", start_x + (current_fStep * step_pixel_width), end_y, start_x + (current_fStep * step_pixel_width), end_y + 10); // axis lines for X-axis
             if (current_fStep % 10 == 0)                                                                                                                                                                                                     // draw axis title every 10 steps
-                web_client.printf("<text x=\"%d\" y=\"%d\" style=\"font-size: 12px; color: black;\">%.3f</text>\n", start_x + (current_fStep * step_pixel_width) - 10, end_y + 25, spec_curr_freq);                                          // axis title for X-axis (frequency)
+                web_client.printf("<text x=\"%d\" y=\"%d\" style=\"color: black;\">%.3f</text>\n", start_x + (current_fStep * step_pixel_width) - 10, end_y + 25, spec_curr_freq);                                          // axis title for X-axis (frequency)
 
             delay(50); // lets wait for a moment (the example code used 100ms but 50ms seems to work, too)
             yield();   // this loop runs for a long time, pet the watchdog and give other tasks a chance to operate
@@ -3384,6 +3454,10 @@ void sub_page_info()
     web_client.printf("<tr><td>Call</td><td>%s</td></tr>\n", meshcom_settings.node_call);
     web_client.printf("<tr><td>Hardware</td><td>%s</td></tr>\n", nbrHardwareName(BOARD_HARDWARE));
     web_client.printf("<tr><td>UTC offset</td><td>%.1f [%s]</td></tr>\n", meshcom_settings.node_utcoff, cTimeSource);
+    // TZ-01: escaped, see sub_page_setup(); an unparsable value (config import) is flagged
+    web_client.printf("<tr><td>Timezone</td><td>%s%s</td></tr>\n",
+        meshcom_settings.node_tz[0] ? htmlEscape(String(meshcom_settings.node_tz)).c_str() : "none",
+        (meshcom_settings.node_tz[0] && !tzActiveAbbrev()) ? " (invalid, ignored)" : "");
     // BAT-01: global_batt==0.0 is the established "no reading" convention (grounded pin, or
     // the ADC-path no-battery detection in batt_functions.cpp) -- same check the on-device
     // displays already use, see loop_functions.cpp.
@@ -3392,7 +3466,7 @@ void sub_page_info()
     } else {
         web_client.printf("<tr><td>Battery</td><td>%.3fV (%d%%) max %.3fV", global_batt / 1000.0, global_proz, meshcom_settings.node_maxv);
         #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
-            web_client.printf("<br>Charge Indicator LED: %s", bCHARGE_LED ? "on" : "off");
+            web_client.printf("<br>Charge Indicator LED: %s", bCHARGE_LED ? "auto (follows charging)" : "off");
         #endif
         web_client.print("</td></tr>\n");
     }
@@ -3421,6 +3495,11 @@ void sub_page_info()
     web_client.printf("</td></tr>\n");
 
     web_client.printf("<tr><td>Network</td><td>");
+    { // GW-LINK: MeshCom server path (Internet/Hamnet) and whether it still answers
+        char gwl[96];
+        gwLinkFormat(gwl, sizeof(gwl), bGATEWAY, meshcom_settings.node_hasIPaddress, millis());
+        web_client.printf("Server: %s<br>", htmlEscape(String(gwl)).c_str());
+    }
     #if defined(HAS_ETHERNET)
     web_client.printf("Ethernet Mode: %s<br>", (meshcom_settings.node_netmode == 1 ? "on" : "off"));
     #endif
@@ -3499,7 +3578,7 @@ void sub_page_info()
     web_client.printf("Debug WX: %s<br>", (bWXDEBUG ? "on" : "off"));
     web_client.printf("Debug BLE: %s<br>", (bBLEDEBUG ? "on" : "off"));
     web_client.printf("</td></tr>\n");
-    web_client.printf("<tr><td>APRS text</td><td>%s</td></tr>\n", meshcom_settings.node_atxt);
+    web_client.printf("<tr><td>APRS text</td><td>%s</td></tr>\n", htmlEscape(String(meshcom_settings.node_atxt)).c_str());
     web_client.printf("<tr><td>Mesh settings</td><td>");
     web_client.printf("max_hop_text: %i<br>", meshcom_settings.max_hop_text);
     web_client.printf("max_hop_pos: %i<br>", meshcom_settings.max_hop_pos);
@@ -3519,10 +3598,10 @@ void sub_page_info()
     if(meshcom_settings.node_netmode == 0)
     {
         if (bWIFIAP)
-            web_client.printf("<tr><td>WiFi SSID</td><td>%s</td></tr>\n", cBLEName);
+            web_client.printf("<tr><td>WiFi SSID</td><td>%s</td></tr>\n", htmlEscape(String(cBLEName)).c_str());
         else
         {
-            web_client.printf("<tr><td>WiFi SSID</td><td>%s</td></tr>\n", meshcom_settings.node_ssid);
+            web_client.printf("<tr><td>WiFi SSID</td><td>%s</td></tr>\n", htmlEscape(String(meshcom_settings.node_ssid)).c_str());
             // WEB-02: shows which AP the node associated with when several APs share the same SSID (mesh sets)
             web_client.printf("<tr><td>WiFi BSSID</td><td>%s</td></tr>\n", WiFi.BSSIDstr().c_str());
         }
@@ -3539,6 +3618,9 @@ void sub_page_info()
     //    web_client.printf("<tr><td><b>hasIpAddress</b></td><td>%s</td></tr>\n", (meshcom_settings.node_hasIPaddress?"yes":"no"));
     
     web_client.printf("<tr><td>hasIpAddress</td><td>%s</td></tr>\n", (meshcom_settings.node_hasIPaddress ? "yes" : "no"));
+
+    // NMTU-01 / #1190: configured MTU and the MSS derived from it (all boards)
+    web_client.printf("<tr><td>MTU</td><td>MTU %i (MSS %i)</td></tr>\n", (int)meshcom_settings.node_ethmtu, (int)meshcom_settings.node_ethmtu - 40);
 
     if (meshcom_settings.node_hasIPaddress)
     {
@@ -3765,7 +3847,7 @@ void _create_setup_textinput_element(const char id[], const char labelText[], St
     snprintf(caption, 100, "<i class=\"btncheckmark\"></i>");
 
     web_client.printf("<label for=\"%s\">%s :</label>\n", id, labelText);
-    web_client.printf("<input type=\"%s\" name=\"%s\" id=\"%s\" value=\"%s\" maxlength=\"%i\" size=\"10\" placeholder=\"%s\">\n", isPassword ? "password" : "text", id, id, inputValue.c_str(), maxlength, placeHolder);
+    web_client.printf("<input type=\"%s\" name=\"%s\" id=\"%s\" value=\"%s\" maxlength=\"%i\" size=\"10\" placeholder=\"%s\">\n", isPassword ? "password" : "text", id, id, htmlEscape(inputValue).c_str(), maxlength, placeHolder); // RM W1b: escape at output (value= attribute)
 
     if(needConfirm) {
         char confirm[200];
@@ -3774,6 +3856,23 @@ void _create_setup_textinput_element(const char id[], const char labelText[], St
     } else {
          uic_button(&web_client, onclick, caption);
     }
+}
+
+
+/**
+ * Number input including label, range hint and button (D10). Same setvalue() button as the text variant;
+ * the JS reads the element by id, so type=number works unchanged. Placeholder is the board default power.
+ */
+void _create_setup_numberinput_element(const char id[], const char labelText[], int inputValue, int minValue, int maxValue, const char parameterName[]){
+    char onclick[100];
+    char caption[100];
+    snprintf(onclick, 100, "setvalue('%s', document.getElementById('%s').value,false)", parameterName, id);
+    snprintf(caption, 100, "<i class=\"btncheckmark\"></i>");
+
+    web_client.printf("<label for=\"%s\">%s :</label>\n", id, labelText);
+    web_client.printf("<input type=\"number\" name=\"%s\" id=\"%s\" value=\"%i\" min=\"%i\" max=\"%i\" step=\"1\" size=\"10\" placeholder=\"%i\">\n", id, id, inputValue, minValue, maxValue, (int)TX_OUTPUT_POWER);
+    uic_button(&web_client, onclick, caption);
+    web_client.printf("<div class=\"font-small\" style=\"grid-column:1/-1\">Allowed on this board: %i to %i dBm</div>\n", minValue, maxValue);
 }
 
 

@@ -1,3 +1,132 @@
+# MeshCom with the CI/CD
+
+Build MeshCom through the github.com yaml file:
+```text
+build-fork-ci
+```
+
+## Legal Notice & Intellectual Property
+This page (a fork of the MeshCom-Firmware by icssw-org, inclusive of build-fork-ci) is dedicated exclusively to the further development and debugging of the source code. Notice is hereby given that any supplementary code contained herein remains subject to my proprietary rights; no authorization is granted for the distribution or sharing thereof outside of this repository, whether in whole or in part. Upon submission and acceptance of a pull request to the original upstream repository, the respective rights for those submitted parts shall be granted to its operators under the project's standard MIT license terms, while copyright and authorship of the specific components remain credited to me.
+
+## Workflow for Fixes, Issues, Features
+Always open a fresh **branch** for each new code contribution (excluding any YAML files) from the official development branch `dev`, rather than from the local default testing branch.
+
+---
+
+## Preparation Local
+
+### Local Git Exclude
+
+To ignore specific development files only on your local machine without changing the project's main `.gitignore`, add these patterns to your local exclude file.
+
+**File Path:** `.git/info/exclude`
+
+Copy and paste the following content into that file:
+
+```text
+# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to use them):
+# *.[oa]
+# *~
+
+# Codium / VS Code
+# created through 'pio run -t compiledb'
+compile_commands.json
+
+# Local binaries
+safeboot.bin
+safeboot-s3.bin
+
+# Additional Information:
+# You can also ignore these files temporarily with:
+#
+#	git update-index --assume-unchanged safeboot.bin
+#	git update-index --assume-unchanged safeboot-s3.bin
+```
+
+---
+
+### CI Build & Synchronization Workflow
+
+This fork uses `build-fork-ci` as a private testing environment. **Never create Pull Requests (PRs) from the `build-fork-ci` branch.** Its sole purpose is to trigger automated builds with your custom setup.
+
+The official development branch of the MeshCom-Firmware remains `dev`.
+All feature and issue branches must branch off from `dev`.
+
+#### Initial Setup (One-time)
+Add the official MeshCom repository as an upstream remote to pull the latest changes:
+```bash
+git remote add upstream https://github.com/icssw-org/MeshCom-Firmware.git
+```
+
+#### Step 1: Always Update the Local 'dev' Branch First
+Before doing anything (testing or developing), always fetch the freshest updates from the official project into your local `dev` branch:
+```bash
+git checkout dev
+git pull upstream dev
+```
+
+---
+
+### Path A: Testing the Latest Code in your Private CI
+If you want to sync the latest upstream changes into your private testing environment and trigger a build:
+
+#### 1. Merge Updates into your CI Branch and Protect README.md
+Switch to your testing branch, merge the new code from `dev`, and ensure your custom `README.md` is not overwritten:
+```bash
+git checkout build-fork-ci
+git merge dev --no-commit --no-ff
+
+# Force Git to keep our custom README.md instead of the upstream version
+git checkout --ours README.md
+
+# Complete the merge and push to trigger your private CI
+git add README.md
+git commit -m "Merge upstream updates and preserved custom CI README"
+git push origin build-fork-ci
+```
+
+---
+
+### Path B: Working on a GitHub Issue (Creating a PR)
+If you want to fix a bug or add a feature to contribute back to the official project:
+
+#### 1. Create your Issue Branch from 'dev'
+Since your local `dev` branch is now perfectly up to date (from Step 1), safely branch off:
+```bash
+git checkout dev
+git checkout -b issue-123
+```
+
+#### 2. Commit and Push your Changes
+Work on your code, commit it, and push it to your GitHub fork to open a clean Pull Request:
+```bash
+git add changed_file.c
+git commit -m "Fix bug described in issue 123"
+git push origin issue-123
+```
+
+#### 3. Branch Naming Conventions
+To maintain a clean and structured repository overview, please use the following prefixes when naming your issue branches:
+* **`bugfix/issue-123-short-description`** – Use this for fixing broken code, crashes, or unintended firmware behavior.
+* **`feature/issue-456-new-sensor`** – Use this for introducing brand new functionalities, supporting new hardware modules, or adding protocol improvements.
+* **`docs/issue-789-update-info`** – Use this exclusively for modifying or expanding code documentation, comments, or project guides without touching executable logic.
+* **`chore/issue-999-cleanup-config`** – Use this for routine tasks, build system maintenance, updating dependencies, or refactoring code structure without changing internal logic or adding features.
+
+---
+
+## Statement
+This README is subject to change and serves as the definitive terms of use for this repository fork.
+
+-- October 2026, Klosterneuburg
+
+---
+---
+
+## Current as of October 10, 2026 :
+
 # MeshCom
 MeshCom is indeed an exciting project of the Institute of Citizen Science for Space & Wireless communication (www.icssw.org)  aimed at creating a resilient, text-based communication tool for amateur radio operators. It utilizes LORA™ modulation technology and the APRS protocol to establish a mesh network in the 70cm band. The main objectives of MeshCom are to realize a connected off-grid messaging system with low energy consumption and cost-effective hardware. The technical implementation is based on LORA™  radio modules, which can transmit messages, positions, measurements, and more over long distances with low transmit power. MeshCom modules can be connected to form a mesh network or establish a messaging network via MeshCom gateways, ideally connected through HAMNET.
 

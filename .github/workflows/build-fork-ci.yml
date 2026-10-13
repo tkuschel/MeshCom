@@ -83,6 +83,7 @@ jobs:
     - name: Convert T_ECHO to UF2
       run: python3 uf2conv.py .pio/build/t_echo/firmware.hex -c -o .pio/build/t_echo/t_echo.uf2 -f 0xADA52840
 
+    # 10. Rename Files and Print Progress
     - name: Rename Files and Print Progress
       run: |
         echo "=== Starting File Renaming Process ==="
@@ -119,46 +120,48 @@ jobs:
         echo "Listing renamed files in build directory:"
         find .pio/build/ \( -name "*.bin" -o -name "*.zip" -o -name "*.uf2" \)
 
-    # 10. Upload all built files as GitHub Workflow Artifacts instead of creating a release
-    - name: Upload Compiled Firmware Artifacts
-      uses: actions/upload-artifact@v7
-      with:
-        name: firmware-build-${{ github.event.inputs.target_branch || github.ref_name }}
-        path: |
-          .pio/build/**/*.bin
-          .pio/build/**/*.zip
-          .pio/build/**/*.uf2
-        retention-days: 7 # Artifacts will be automatically deleted after 7 days
 
-    # Dynamically create the smart flashing scripts next to the T-Beam binary
+    # 11. Dynamically create the smart flashing scripts next to the T-Beam binary
     # with optional bootloader detection and group check
     - name: Create Desktop Flashing Scripts
       run: |
-        # Ensure the directory exists before attempting to write scripts into it
-        mkdir -p .pio/build/ttgo_tbeam
-
-        # 1. Create the smart Linux Shell Script
-        cat << 'EOF' > .pio/build/ttgo_tbeam/flash_tbeam.sh
+        # ----------------------------------------------------------------------
+        # 1. Universal Linux Shell Script
+        # ----------------------------------------------------------------------
+        cat << 'EOF' > flash_esp32_board.sh
         #!/usr/bin/env bash
         GREEN='\033[0;32m'
         RED='\033[0;31m'
         YELLOW='\033[1;33m'
         NC='\033[0m'
 
-        echo -e "${YELLOW}=== MeshCom T-Beam Linux Flashing Script ===${NC}"
+        echo -e "${YELLOW}=== MeshCom Universal ESP32 Flashing Script ===${NC}"
 
         if ! command -v esptool.py &> /dev/null; then
             echo -e "${RED}Error: esptool.py is not installed.${NC}"
-            echo "Please install it via Arch Linux, e.g.: 'yay -S esptool' or via pip: 'pip install esptool'"
+            echo "Please install it via your package manager or pip: 'pip install esptool'"
             exit 1
         fi
 
-        PORT=$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n 1)
-        if [ -z "$PORT" ]; then
-            echo -e "${RED}Error: No connected T-Beam (ttyUSB/ttyACM) found!${NC}"
+        # Auto-detect Firmware File
+        if [ -f "ttgo_tbeam.bin" ]; then
+            FIRMWARE="ttgo_tbeam.bin"
+            BOARD_NAME="T-Beam"
+        elif [ -f "ttgo-lora32-v21.bin" ]; then
+            FIRMWARE="ttgo-lora32-v21.bin"
+            BOARD_NAME="TTGO LoRa32 v2.1"
+        else
+            echo -e "${RED}Error: No matching firmware binary found in this folder!${NC}"
             exit 1
         fi
-        echo -e "${GREEN}Detected T-Beam on port:${NC} $PORT"
+
+        echo -e "${GREEN}Selected Firmware:${NC} $FIRMWARE ($BOARD_NAME)"
+        PORT=$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -n 1)
+        if [ -z "$PORT" ]; then
+            echo -e "${RED}Error: No connected ESP32 Board (ttyUSB/ttyACM) found!${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}Detected Board on port:${NC} $PORT"
 
         # Dynamic Permission Check: Determine required group for the specific TTY device
         REQUIRED_GROUP=$(stat -c '%G' "$PORT")
@@ -173,15 +176,8 @@ jobs:
             fi
         fi
 
-        FIRMWARE="ttgo_tbeam.bin"
         BOOTLOADER="bootloader.bin"
 
-        if [ ! -f "$FIRMWARE" ]; then
-            echo -e "${RED}Error: File '$FIRMWARE' not found!${NC}"
-            exit 1
-        fi
-
-        # Determine flash strategy based on bootloader file availability
         if [ -f "$BOOTLOADER" ]; then
             echo -e "${GREEN}Bootloader found!${NC} Flashing Bootloader (0x1000) and Firmware (0x10000)..."
             esptool.py --chip esp32 --port "$PORT" --baud 921600 write_flash -z 0x1000 "$BOOTLOADER" 0x10000 "$FIRMWARE"
@@ -191,30 +187,43 @@ jobs:
         fi
 
         if [ $? -eq 0 ]; then
-            echo -e "${GREEN}=== Success! T-Beam successfully updated ===${NC}"
+            echo -e "${GREEN}=== Success! $BOARD_NAME successfully updated ===${NC}"
         else
             echo -e "${RED}=== Flash failed! ===${NC}"
             exit 1
         fi
         EOF
-        chmod +x .pio/build/ttgo_tbeam/flash_tbeam.sh
+        chmod +x flash_esp32_board.sh
 
-        # 2. Create the smart Windows Batch Script
-        cat << 'EOF' > .pio/build/ttgo_tbeam/flash_tbeam.bat
+        # ----------------------------------------------------
+        # 2. Universal Windows Batch Script
+        # ----------------------------------------------------
+        cat << 'EOF' > flash_esp32_board.bat
         @echo off
         setlocal enabledelayedexpansion
         echo ===================================================
-        echo === MeshCom T-Beam Windows Flashing Script =======
+        echo === MeshCom Universal ESP32 Windows Flashing ======
         echo ===================================================
 
-        set "FIRMWARE=ttgo_tbeam.bin"
         set "BOOTLOADER=bootloader.bin"
+        set "FIRMWARE="
+        set "BOARD_NAME="
 
-        if not exist "%FIRMWARE%" (
-            echo [ERROR] File "%FIRMWARE%" not found!
+        if exist "ttgo_tbeam.bin" (
+            set "FIRMWARE=ttgo_tbeam.bin"
+            set "BOARD_NAME=T-Beam"
+        ) else if exist "ttgo-lora32-v21.bin" (
+            set "FIRMWARE=ttgo-lora32-v21.bin"
+            set "BOARD_NAME=TTGO LoRa32 v2.1"
+        )
+
+        if "%FIRMWARE%"="" (
+            echo [ERROR] No matching firmware binary found in this folder!
             pause
             exit /b 1
         )
+
+        echo [INFO] Selected Firmware: %FIRMWARE% (%BOARD_NAME%)
 
         set "COMPORT="
         for /f "tokens=2 delims=()" %%A in ('wmic path Win32_PnPEntity get Name ^| findstr /i "COM" ^| findstr /i "Silicon CP210 CH340 CH9102 USB-to-UART"') do set "COMPORT=%%A"
@@ -222,11 +231,11 @@ jobs:
             for /f "tokens=2 delims=()" %%A in ('wmic path Win32_PnPEntity get Name ^| findstr /i "(COM"') do set "COMPORT=%%A"
         )
         if "%COMPORT%"="" (
-            echo [ERROR] No T-Beam or USB-UART bridge detected!
+            echo [ERROR] No ESP32 Board or USB-UART bridge detected!
             pause
             exit /b 1
         )
-        echo [INFO] Detected T-Beam on port: %COMPORT%
+        echo [INFO] Detected Board on port: %COMPORT%
 
         if exist "%BOOTLOADER%" (
             echo [INFO] Bootloader found! Flashing Bootloader [0x1000] and Firmware [0x10000]...
@@ -237,14 +246,37 @@ jobs:
         )
 
         if %ERRORLEVEL% EQU 0 (
-            echo === SUCCESS! T-Beam successfully updated ===
+            echo === SUCCESS! %BOARD_NAME% successfully updated ===
         ) else (
             echo [ERROR] Flash failed!
         )
         pause
         EOF
 
+        # ----------------------------------------------------
+        # 3. Distribute Scripts into target build directories
+        # ----------------------------------------------------
+        mkdir -p .pio/build/ttgo_tbeam
+        mkdir -p .pio/build/ttgo-lora32-v21
+
+        cp flash_esp32_board.sh .pio/build/ttgo_tbeam/
+        cp flash_esp32_board.bat .pio/build/ttgo_tbeam/
+
+        cp flash_esp32_board.sh .pio/build/ttgo-lora32-v21/
+        cp flash_esp32_board.bat .pio/build/ttgo-lora32-v21/
+
     # 12. Upload the T-Beam binary, bootloader and scripts with zip compression
+    - name: Upload Compiled Firmware Artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: firmware-build-${{ github.event.inputs.target_branch || github.ref_name }}
+        path: |
+          .pio/build/**/*.bin
+          .pio/build/**/*.zip
+          .pio/build/**/*.uf2
+        retention-days: 7 # Artifacts will be automatically deleted after 7 days
+
+    # 13. Upload T-Beam Bundle (ZIP)
     - name: Upload T-Beam Firmware and Flashing Scripts (Bundle)
       uses: actions/upload-artifact@v7
       with:
@@ -257,10 +289,31 @@ jobs:
         archive: true
         retention-days: 14
 
-    # 13. Upload the single T-Beam binary directly without any zip compression
+    # 14. Upload the single T-Beam binary directly without any zip compression
     - name: Upload T-Beam Firmware (firmware binary w/o bootloader)
       uses: actions/upload-artifact@v7
       with:
         path: .pio/build/ttgo_tbeam/ttgo_tbeam.bin
+        archive: false
+        retention-days: 14
+
+    # 15. Upload TTGO LoRa32 v2.1 Bundle (ZIP/Archive)
+    - name: Upload TTGO LoRa32 v2.1 Firmware and Flashing Scripts (Bundle)
+      uses: actions/upload-artifact@v7
+      with:
+        name: ttgo-lora32-v21-desktop-flasher-${{ github.event.inputs.target_branch || github.ref_name }}
+        path: |
+          .pio/build/ttgo-lora32-v21/ttgo-lora32-v21.bin
+          .pio/build/ttgo-lora32-v21/bootloader.bin
+          .pio/build/ttgo-lora32-v21/flash_esp32_board.sh
+          .pio/build/ttgo-lora32-v21/flash_esp32_board.bat
+        archive: true
+        retention-days: 14
+
+    # 16. Upload TTGO LoRa32 v2.1 Raw Binary (Uncompressed)
+    - name: Upload TTGO LoRa32 v2.1 Firmware (firmware binary w/o bootloader)
+      uses: actions/upload-artifact@v7
+      with:
+        path: .pio/build/ttgo-lora32-v21/ttgo-lora32-v21.bin
         archive: false
         retention-days: 14

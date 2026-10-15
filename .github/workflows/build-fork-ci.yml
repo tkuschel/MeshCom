@@ -88,7 +88,7 @@ jobs:
       run: |
         echo "=== Starting File Renaming Process ==="
 
-        echo "Processing DevKitC and T-Deck boards..."
+        echo "Processing all boards..."
         # Automatically loop through all build directories to rename firmware files dynamically
         # This handles DevKitC, Heltec, TTGO, LilyGo, and any future boards automatically
         for dir in .pio/build/*/; do
@@ -123,8 +123,19 @@ jobs:
 
     # 11. Dynamically create the smart flashing scripts next to the T-Beam binary
     # with optional bootloader detection and group check
+    # the table of flash addresses usually found at /partitions-4MB-safeboot.csv
+
     - name: Create Desktop Flashing Scripts
       run: |
+        # ----------------------------------------------------------------------
+        # 0. Flash Address Configuration  ← edit here to change the layout
+        # ----------------------------------------------------------------------
+        FLASH_BOOTLOADER_ADDR="0x1000"
+        FLASH_PARTITIONS_ADDR="0x8000"
+        FLASH_OTADATA_ADDR="0xE000"
+        FLASH_SAFEBOOT_ADDR="0x10000"
+        FLASH_FIRMWARE_ADDR="0xC0000"
+
         # ----------------------------------------------------------------------
         # 1. Universal Linux Shell Script
         # ----------------------------------------------------------------------
@@ -137,9 +148,10 @@ jobs:
 
         echo -e "${YELLOW}=== MeshCom Universal ESP32 Flashing Script ===${NC}"
 
-        if ! command -v esptool.py &> /dev/null; then
-            echo -e "${RED}Error: esptool.py is not installed.${NC}"
+        if ! command -v esptool &> /dev/null; then
+            echo -e "${RED}Error: esptool is not installed.${NC}"
             echo "Please install it via your package manager or pip: 'pip install esptool'"
+            echo "Linux Arch: 'sudo pacman -Sy && sudo pacman -S extra-testing/esptool'"
             exit 1
         fi
 
@@ -176,15 +188,24 @@ jobs:
             fi
         fi
 
-        BOOTLOADER="bootloader.bin"
-
-        if [ -f "$BOOTLOADER" ]; then
-            echo -e "${GREEN}Bootloader found!${NC} Flashing Bootloader (0x1000) and Firmware (0x10000)..."
-            esptool.py --chip esp32 --port "$PORT" --baud 921600 write_flash -z 0x1000 "$BOOTLOADER" 0x10000 "$FIRMWARE"
-        else
-            echo -e "${YELLOW}No bootloader found.${NC} Flashing Firmware only (0x10000)..."
-            esptool.py --chip esp32 --port "$PORT" --baud 921600 write_flash -z 0x10000 "$FIRMWARE"
+        # Build flash arguments from the address table (only include files that exist)
+        FLASH_ARGS=""
+        if [ -f "bootloader.bin" ]; then
+          FLASH_ARGS="$FLASH_ARGS __BOOTLOADER_ADDR__ bootloader.bin"
         fi
+        if [ -f "partitions.bin" ]; then
+          FLASH_ARGS="$FLASH_ARGS __PARTITIONS_ADDR__ partitions.bin"
+        fi
+        if [ -f "otadata.bin" ]; then
+          FLASH_ARGS="$FLASH_ARGS __OTADATA_ADDR__ otadata.bin"
+        fi
+        if [ -f "safeboot.bin" ]; then
+          FLASH_ARGS="$FLASH_ARGS __SAFEBOOT_ADDR__ safeboot.bin"
+        fi
+        FLASH_ARGS="$FLASH_ARGS __FIRMWARE_ADDR__ $FIRMWARE"
+
+        echo -e "${GREEN}Flashing:${NC}$FLASH_ARGS"
+        esptool --chip esp32 --port "$PORT" --baud 921600 write_flash -z $FLASH_ARGS
 
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}=== Success! $BOARD_NAME successfully updated ===${NC}"
@@ -193,6 +214,15 @@ jobs:
             exit 1
         fi
         EOF
+
+        # Substitute address placeholders with configured hex values
+        sed -i \
+          -e "s|__BOOTLOADER_ADDR__|${FLASH_BOOTLOADER_ADDR}|g" \
+          -e "s|__PARTITIONS_ADDR__|${FLASH_PARTITIONS_ADDR}|g" \
+          -e "s|__OTADATA_ADDR__|${FLASH_OTADATA_ADDR}|g" \
+          -e "s|__SAFEBOOT_ADDR__|${FLASH_SAFEBOOT_ADDR}|g" \
+          -e "s|__FIRMWARE_ADDR__|${FLASH_FIRMWARE_ADDR}|g" \
+          flash_esp32_board.sh
         chmod +x flash_esp32_board.sh
 
         # ----------------------------------------------------
@@ -205,7 +235,6 @@ jobs:
         echo === MeshCom Universal ESP32 Windows Flashing ======
         echo ===================================================
 
-        set "BOOTLOADER=bootloader.bin"
         set "FIRMWARE="
         set "BOARD_NAME="
 
@@ -227,31 +256,50 @@ jobs:
 
         set "COMPORT="
         for /f "tokens=2 delims=()" %%A in ('wmic path Win32_PnPEntity get Name ^| findstr /i "COM" ^| findstr /i "Silicon CP210 CH340 CH9102 USB-to-UART"') do set "COMPORT=%%A"
-        if "%COMPORT%"="" (
-            for /f "tokens=2 delims=()" %%A in ('wmic path Win32_PnPEntity get Name ^| findstr /i "(COM"') do set "COMPORT=%%A"
+        if "%COMPORT%"=="" (
+          for /f "tokens=2 delims=()" %%A in ('wmic path Win32_PnPEntity get Name ^| findstr /i "(COM"') do set "COMPORT=%%A"
         )
-        if "%COMPORT%"="" (
-            echo [ERROR] No ESP32 Board or USB-UART bridge detected!
-            pause
-            exit /b 1
+        if "%COMPORT%"=="" (
+          echo [ERROR] No ESP32 Board or USB-UART bridge detected!
+          pause
+          exit /b 1
         )
         echo [INFO] Detected Board on port: %COMPORT%
 
-        if exist "%BOOTLOADER%" (
-            echo [INFO] Bootloader found! Flashing Bootloader [0x1000] and Firmware [0x10000]...
-            esptool.py --chip esp32 --port %COMPORT% --baud 921600 write_flash -z 0x1000 "%BOOTLOADER%" 0x10000 "%FIRMWARE%"
-        ) else (
-            echo [INFO] No bootloader found. Flashing Firmware only [0x10000]...
-            esptool.py --chip esp32 --port %COMPORT% --baud 921600 write_flash -z 0x10000 "%FIRMWARE%"
+        set "FLASH_ARGS="
+        if exist "bootloader.bin" (
+          set "FLASH_ARGS=!FLASH_ARGS! __BOOTLOADER_ADDR__ bootloader.bin"
         )
+        if exist "partitions.bin" (
+          set "FLASH_ARGS=!FLASH_ARGS! __PARTITIONS_ADDR__ partitions.bin"
+        )
+        if exist "otadata.bin" (
+          set "FLASH_ARGS=!FLASH_ARGS! __OTADATA_ADDR__ otadata.bin"
+        )
+        if exist "safeboot.bin" (
+          set "FLASH_ARGS=!FLASH_ARGS! __SAFEBOOT_ADDR__ safeboot.bin"
+        )
+        set "FLASH_ARGS=!FLASH_ARGS! __FIRMWARE_ADDR__ %FIRMWARE%"
+
+        echo [INFO] Flashing: !FLASH_ARGS!
+        esptool --chip esp32 --port %COMPORT% --baud 921600 write_flash -z !FLASH_ARGS!
 
         if %ERRORLEVEL% EQU 0 (
-            echo === SUCCESS! %BOARD_NAME% successfully updated ===
+          echo === SUCCESS! %BOARD_NAME% successfully updated ===
         ) else (
-            echo [ERROR] Flash failed!
+          echo [ERROR] Flash failed!
         )
         pause
         EOF
+
+        # Substitute address placeholders with configured hex values
+        sed -i \
+          -e "s|__BOOTLOADER_ADDR__|${FLASH_BOOTLOADER_ADDR}|g" \
+          -e "s|__PARTITIONS_ADDR__|${FLASH_PARTITIONS_ADDR}|g" \
+          -e "s|__OTADATA_ADDR__|${FLASH_OTADATA_ADDR}|g" \
+          -e "s|__SAFEBOOT_ADDR__|${FLASH_SAFEBOOT_ADDR}|g" \
+          -e "s|__FIRMWARE_ADDR__|${FLASH_FIRMWARE_ADDR}|g" \
+        flash_esp32_board.bat
 
         # ----------------------------------------------------
         # 3. Distribute Scripts into target build directories
@@ -265,7 +313,7 @@ jobs:
         cp flash_esp32_board.sh .pio/build/ttgo-lora32-v21/
         cp flash_esp32_board.bat .pio/build/ttgo-lora32-v21/
 
-    # 12. Upload the T-Beam binary, bootloader and scripts with zip compression
+    # 12. Upload all compiled firmware artifacts with zip compression
     - name: Upload Compiled Firmware Artifacts
       uses: actions/upload-artifact@v7
       with:
@@ -284,8 +332,8 @@ jobs:
         path: |
           .pio/build/ttgo_tbeam/ttgo_tbeam.bin
           .pio/build/ttgo_tbeam/bootloader.bin
-          .pio/build/ttgo_tbeam/flash_tbeam.sh
-          .pio/build/ttgo_tbeam/flash_tbeam.bat
+          .pio/build/ttgo_tbeam/flash_esp32_board.sh
+          .pio/build/ttgo_tbeam/flash_esp32_board.bat   
         archive: true
         retention-days: 14
 
@@ -293,6 +341,7 @@ jobs:
     - name: Upload T-Beam Firmware (firmware binary w/o bootloader)
       uses: actions/upload-artifact@v7
       with:
+        name: ttgo-tbeam-raw-${{ github.event.inputs.target_branch || github.ref_name }}
         path: .pio/build/ttgo_tbeam/ttgo_tbeam.bin
         archive: false
         retention-days: 14

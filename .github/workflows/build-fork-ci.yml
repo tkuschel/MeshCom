@@ -205,7 +205,7 @@ jobs:
         FLASH_ARGS="$FLASH_ARGS __FIRMWARE_ADDR__ $FIRMWARE"
 
         echo -e "${GREEN}Flashing:${NC}$FLASH_ARGS"
-        esptool --chip esp32 --port "$PORT" --baud 921600 write_flash -z $FLASH_ARGS
+        esptool --chip esp32 --port "$PORT" --baud 921600 write-flash -z $FLASH_ARGS
 
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}=== Success! $BOARD_NAME successfully updated ===${NC}"
@@ -282,7 +282,7 @@ jobs:
         set "FLASH_ARGS=!FLASH_ARGS! __FIRMWARE_ADDR__ %FIRMWARE%"
 
         echo [INFO] Flashing: !FLASH_ARGS!
-        esptool --chip esp32 --port %COMPORT% --baud 921600 write_flash -z !FLASH_ARGS!
+        esptool --chip esp32 --port %COMPORT% --baud 921600 write-flash -z !FLASH_ARGS!
 
         if %ERRORLEVEL% EQU 0 (
           echo === SUCCESS! %BOARD_NAME% successfully updated ===

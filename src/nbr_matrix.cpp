@@ -80,7 +80,8 @@ static_assert(sizeof(NbrMatrix::echo_id) + sizeof(NbrMatrix::echo_first) +
               "Echo-Tabelle: 4 x (msg_id, zwei Masken, Minute)");
 static_assert(sizeof(NbrMatrix) <=
                   8u * NBR_MAX_ROWS + 12u * NBR_MAX_ROWS + 16u * NBR_MASK_WORDS * NBR_MAX_ROWS + 6u * NBR_MAX_EDGES +
-                      13u * NBR_EXT_SLOTS + NBR_MAX_ROWS + (12u + 8u * NBR_MASK_WORDS) * NBR_HZ_ENTRIES + 10u +
+                      13u * NBR_EXT_SLOTS + NBR_MAX_ROWS + 2u * NBR_MAX_ROWS +
+                      (12u + 8u * NBR_MASK_WORDS) * NBR_HZ_ENTRIES + 10u +
                       4u * (4u + 16u * NBR_MASK_WORDS + 2u) + 4u + 16u,
               "NbrMatrix: Fuellung ueber 16 Byte (Feldreihenfolge pruefen)");
 
@@ -570,6 +571,7 @@ static void nbrIRowBlank(NbrMatrix &m, int idx)
     m.row[idx].lon16 = (int16_t)NBR_POS_UNKNOWN;
     m.row[idx].ext = 0xFF;
     m.gw_min[idx] = 0;
+    m.fw[idx] = 0;
 }
 
 // Zeile idx vollstaendig leeren: ihre Kanten frei (je zwei Maskenbits), ihr
@@ -1733,7 +1735,7 @@ static void nbrISymFlush(NbrSymSink &s)
 // --- Relay-Entscheidung, innerer Teil ----------------------------------------------
 
 static NbrNeed nbrIRelayNeed(const NbrMatrix &m, const uint64_t *words, int ntok, uint16_t now_min, bool sym,
-                             NbrSymSink &sink)
+                             NbrSymSink &sink, bool gw_has_frame)
 {
     NbrNeed r;
     r.need = nbrMaskNone();
@@ -1764,6 +1766,13 @@ static NbrNeed nbrIRelayNeed(const NbrMatrix &m, const uint64_t *words, int ntok
             nbrICovers(m, c, ed))
             nbrMaskSet(hasf, ed.y);
     }
+    // Server-Frame (GWRX-01): jedes GW-gehaltene Gateway hat ihn vom Server. Nur die
+    // Zeile selbst, nicht ihre Hoerer: die haben ihn erst, wenn das Gateway sendet
+    // (das rechnet die Deckung beim gehoerten Duplikat, nbrCoverMask).
+    if (gw_has_frame)
+        for (int x = 1; x < NBR_MAX_ROWS; x++)
+            if (nbrIUsed(m, x) && nbrIGwHeld(m, x, now_min))
+                nbrMaskSet(hasf, x);
 
     NbrMask dep = nbrMaskOr(c.direct, nbrIHeardMeMask(m, now_min));
     nbrMaskClear(dep, 0);
@@ -2074,6 +2083,7 @@ bool nbrRowGet(const NbrMatrix &m, int row, NbrRowView *out)
     bool ok = nbrIReady(m) && (row == 0 || nbrIUsed(m, row)); // vor nbrInit(): keine Zeile
     w = m.call[row];
     r = m.row[row];
+    uint16_t fw = m.fw[row];
     NBR_UNLOCK();
     if (!ok)
         return false;
@@ -2086,6 +2096,9 @@ bool nbrRowGet(const NbrMatrix &m, int row, NbrRowView *out)
     out->flags = r.flags;
     out->hw = r.hw;
     out->ncnt = r.ncnt;
+    out->fw_ver = (uint8_t)(fw & 0xFF);
+    uint16_t sub = (uint16_t)(fw >> 8);
+    out->fw_sub = (sub >= 1 && sub <= 26) ? (char)('a' + sub - 1) : 0;
     return true;
 }
 
@@ -2426,6 +2439,21 @@ void nbrNoteNcnt(NbrMatrix &m, const char *call, int ncnt, uint16_t now_min)
     int x = nbrIReady(m) ? nbrIFindWord(m, w) : -1;
     if (x >= 0)
         m.row[x].ncnt = (uint8_t)(ncnt > 255 ? 255 : ncnt);
+    NBR_UNLOCK();
+}
+
+void nbrNoteFw(NbrMatrix &m, const char *call, uint8_t ver, char sub)
+{
+    if (ver == 0)
+        return;
+    uint16_t v = (uint16_t)ver;
+    if (sub >= 'a' && sub <= 'z')
+        v |= (uint16_t)((sub - 'a' + 1) << 8);
+    uint64_t w = nbrIEncode(call);
+    NBR_LOCK();
+    int x = nbrIReady(m) ? nbrIFindWord(m, w) : -1;
+    if (x > 0)
+        m.fw[x] = v;
     NBR_UNLOCK();
 }
 
@@ -2892,7 +2920,8 @@ NbrMask nbrHearersMask(const NbrMatrix &m, int row, uint16_t now_min)
     return r;
 }
 
-NbrNeed nbrRelayNeed(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id)
+static NbrNeed nbrNeedImpl(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id,
+                           bool gw_has_frame)
 {
     char tokens[8][NBR_CALL_LEN];
     int ntok = nbrTokenizePath(path, tokens, 8);
@@ -2910,10 +2939,20 @@ NbrNeed nbrRelayNeed(const NbrMatrix &m, const char *path, uint16_t now_min, boo
     NbrSymSink sink;
     NBR_LOCK();
     nbrISymBegin(sink, m, tokens, now_min, msg_id);
-    NbrNeed r = nbrIRelayNeed(m, words, ntok, now_min, sym, sink);
+    NbrNeed r = nbrIRelayNeed(m, words, ntok, now_min, sym, sink, gw_has_frame);
     NBR_UNLOCK();
     nbrISymFlush(sink);
     return r;
+}
+
+NbrNeed nbrRelayNeed(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id)
+{
+    return nbrNeedImpl(m, path, now_min, sym, msg_id, false);
+}
+
+NbrNeed nbrServerNeed(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id)
+{
+    return nbrNeedImpl(m, path, now_min, sym, msg_id, true);
 }
 
 NbrMask nbrCoverMask(const NbrMatrix &m, const char *relayer, uint16_t now_min, bool sym,

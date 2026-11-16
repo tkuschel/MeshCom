@@ -12,9 +12,9 @@
 #define _TDECK_HELPERS_H_
 
 #define BRIGHTNESS_STEPS 16
-#define BRIGHTNESS_LEVELS 4
 
 #include <configuration.h>
+#include <daylight.h> // BlMode helpers (header-only)
 
 extern uint8_t current_brightness_level;
 extern uint8_t pre_sleep_brightness_level;
@@ -23,6 +23,14 @@ extern bool tft_is_sleeping; // Add this line
 void cycleBrightness();
 void resetBrightness();
 void setBrightness(uint8_t);
+// TD-23: saved day/night backlight level
+void brightnessApplySaved();
+void brightnessTick(bool force);
+void brightnessLogState(const char *why);
+uint8_t brightnessActiveLevel();
+int brightnessMode();                                  // BlMode from node_bl_auto / node_bl_fnight
+void brightnessSetActiveLevel(uint8_t level);          // 1..16, no callback
+void brightnessSetChangeCallback(void (*cb)(uint8_t)); // fired by cycleBrightness (SYM+B) only
 void setKeyboardBacklight(uint8_t value);
 
 void log_json_to_sd(const char* filename, const String& json_object_str);

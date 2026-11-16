@@ -65,3 +65,22 @@ bool sanitize_max_voltage(float &v, float board_min, float board_max, sanitize_l
  * compat merge) and -20 (default since upstream 50c1ce59). Anything else is
  * returned unchanged; range clamping stays in getPower(). */
 int resolve_tx_power(int stored, int board_default);
+
+/* TD-23: a stored T-Deck backlight level (node_bl_day / node_bl_night) must lie
+ * in 1..16; 0 would mean "panel off" and is never stored. Anything else is
+ * reset to `def`. Returns true if the value was corrected. */
+bool sanitize_backlight_level(int &v, int def, const char *field, sanitize_log_fn log);
+
+/* SENS-04: the one-wire DHT type (node_dht_type, --dht) is 11 (DHT11) or 22 (DHT22). */
+bool dht_type_valid(int v);
+/* Resets anything else (a wiped or corrupt value reads 0) to 11. Returns true if corrected. */
+bool sanitize_dht_type(int &v, sanitize_log_fn log);
+/* True when the name the DHT driver reports ("DHT11", "DHT22") matches the configured type. */
+bool dht_name_matches(const char *name, int type);
+
+/* A stored ping target (node_pingcall) must be a plain callsign:
+ * no group, no special target, not the node's own call (see ping_target.h).
+ * An invalid one is cleared to "" and logged once as
+ * field "node_pingcall", old value -> "". An empty target is valid ("off").
+ * Returns true if the value was cleared. */
+bool sanitize_ping_target(char *pingcall, size_t n, const char *own_call, sanitize_log_fn log);

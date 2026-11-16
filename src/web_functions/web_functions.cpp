@@ -3,6 +3,7 @@
  *  @date        2025-12-03
  */
 #include "mc_text.h"
+#include "msg_body.h"      // CHARS-01: strip only the trailing {NNN ACK marker
 #include "uptime_min.h"   // wrap-safe 16-bit uptime minutes (NBR stamps)
 #include <Arduino.h>
 
@@ -30,6 +31,47 @@
 #include <TinyGPSPlus.h>       // DIST auf der MHeard-Seite -- reine distanceBetween()-Rechnung, kein GPS-Modul noetig
 #include "sto_notice.h"        // stage 4: stoHolder() for the messages-page held mark, all boards
 #include "own_msg_status.h" // durable per-message delivery state for the messages-page tick
+#include "rm_runtime.h"          // RM-07 (#1189): RmStats/g_rmStats for the info page RM row
+#include <prod_lock.h>      // prodLockNormalise(): an imported file may hold values the setters now refuse
+#include <blocked_calls.h> // BLK-01: info row + setup card
+#include <instrument.h>     // INSTRUMENT_ENABLED
+#include "web_server_gate.h" // WEB-STOP-01: stopWebserver() acts on a running server only
+#include "watchdog_feed.h"  // meshcom_wdt_feed(): neighbour matrix rows run in the WDT-guarded loop task
+#include "board_led.h"         // LED-08: ledFitted() for the setup controls and info rows
+#include "charge_led_mode.h"   // LED-02: chargeLedModeName() for the info row
+#if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
+#include "esp32/esp32_pmu.h"    // LED-02: effective charge-LED mode (RM override)
+#endif
+#include "web_auth.h"           // WEB-AUTH-01: nonce login + cookie sessions
+#include "web_guard.h"          // RM GUI W1c: Host allowlist (DNS rebinding) and Sec-Fetch-Site (CSRF), header-only
+#include "web_rm_util.h"       // RM GUI G1: rm_wipe / rm_wipe_string / rm_form_decode / rm_json_str shared with web_rm_page.cpp
+#include "web_rm_page.h"       // RM GUI W2b: sub_page_remote(), rmScaffoldJs()
+#include "web_rm_handlers.h"   // RM GUI W2a: /rmpasswd, /rmnodes, /rmheard, rmSendBySlot()
+#include "web_rm_parse.h"      // RM GUI W2a: rmParseSendBody()
+// RM GUI W1c: set per request by the guard in work_webpage(); send_http_header() and sub_config_download()
+// drop the CORS headers when it is false (state-changing paths, /config, /rmstatus).
+static bool web_cors_ok = true;
+#if defined(ESP32)
+#include "esp32/fw_update_net.h" // AU-09 (#1187): FwNetStatus/fwNetGetStatus for the info row and the update banner
+#include <esp_timer.h>    // AU web GUI: /austatus "up" (seconds since boot)
+#include <esp_idf_version.h>
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include <esp_app_desc.h> // AU web GUI: /austatus "img" (running image ELF SHA-256)
+#define MC_RUNNING_APP_DESC() esp_app_get_description()
+#else
+#include <esp_ota_ops.h>  // AU web GUI: /austatus "img" (running image ELF SHA-256); IDF 4.4 name
+#define MC_RUNNING_APP_DESC() esp_ota_get_app_description()
+#endif
+#include "au_ui_state.h"  // AU web GUI: AuUiIn/auStatusJson for GET /austatus, auEtaS
+#include "safeboot/safeboot_ver.h" // AU-12: AU_SAFEBOOT_MIN for the Firmware Update card footnote (header-only)
+#ifndef MC_ENV_NAME
+#define MC_ENV_NAME ""
+#endif
+static void sub_au_status(); // GET /austatus (defined next to call_function)
+#ifndef MC_BUILD_TAG
+#define MC_BUILD_TAG ""
+#endif
+#endif
 #include <url_decode.h>         // #1173: decodeURLPercentCoding() -- full percent-decoding of WebUI parameters
 #include <charset_filter.h>     // #1173: UTF-8-safe cut of the 150-byte web message
 #include "clock.h"              // TZ-01: tzActiveAbbrev() -- flags an unparsable node_tz on the info page
@@ -42,6 +84,12 @@
 #include "web_nodefunctioncalls.h"
 #include "web_commonServer.h"
 #include "gw_link_status.h"
+#include "gw_reg_runtime.h"
+#include "gw_servers.h"
+#if defined(NRF52_SERIES)
+#include <RAK13800_W5100S.h> // IPAddress for nrf_eth.h
+#include <nrf_eth.h>          // ethIsStaticConfigured()
+#endif
 #if defined(BOARD_RAK4630)
 #include "w5100.h"          // #1183: W5100.readSn*/writeSnMSSR for the web socket's MSS
 #endif
@@ -146,9 +194,69 @@ static void webApplyEthMss()
 }
 #endif
 
-// password check
-char web_ip[10][20] = {0};
-long web_ip_passwd_time[10] = {0};
+// WEB-AUTH-01: platform random source for login nonces and session tokens (web_auth.h WebAuthRng)
+#if defined(ESP32)
+#include <esp_random.h>
+static bool web_auth_rng(uint8_t *out, size_t n)
+{
+    esp_fill_random(out, n); // hardware TRNG
+    return true;
+}
+#elif defined(NRF52_SERIES)
+#include <nrf_soc.h>
+#include <nrf_sdm.h>
+static bool web_auth_rng(uint8_t *out, size_t n)
+{
+    // via the SoftDevice when it is enabled (NRF_RNG is owned by it then), else the peripheral directly
+    uint8_t sd_en = 0;
+    sd_softdevice_is_enabled(&sd_en);
+    size_t i = 0;
+    uint32_t t0 = millis();
+    if (sd_en)
+    {
+        while (i < n && (uint32_t)(millis() - t0) < 200)
+        {
+            uint8_t avail = 0;
+            sd_rand_application_bytes_available_get(&avail);
+            size_t want = n - i;
+            if (avail > 0 && want > avail)
+                want = avail;
+            if (avail > 0 && sd_rand_application_vector_get(out + i, (uint8_t)want) == NRF_SUCCESS)
+                i += want;
+            else
+                delay(1);
+        }
+    }
+    else
+    {
+        NRF_RNG->EVENTS_VALRDY = 0;
+        NRF_RNG->TASKS_START = 1;
+        while (i < n)
+        {
+            uint32_t t1 = millis();
+            while (!NRF_RNG->EVENTS_VALRDY && (uint32_t)(millis() - t1) < 50)
+                ;
+            if (!NRF_RNG->EVENTS_VALRDY)
+                break;
+            out[i++] = (uint8_t)NRF_RNG->VALUE;
+            NRF_RNG->EVENTS_VALRDY = 0;
+        }
+        NRF_RNG->TASKS_STOP = 1;
+    }
+    // the hardware RNG did not answer in time (should never happen): no nonce, no session
+    return i == n;
+}
+#else
+#error "web_auth_rng: no random source for this platform"
+#endif
+
+// WEB-AUTH-01: client address for the serial log lines (IPAddress::toString() does not exist on nRF52)
+static const char *web_remote_ip(char *buf, size_t n)
+{
+    IPAddress ip = web_client.remoteIP();
+    snprintf(buf, n, "%i.%i.%i.%i", ip[0], ip[1], ip[2], ip[3]);
+    return buf;
+}
 
 // gps_functions.cpp instanziiert das TinyGPSPlus-Objekt unbedingt (auch ohne
 // ENABLE_GPS); hier nur fuer distanceBetween() auf der MHeard-Seite genutzt.
@@ -283,6 +391,10 @@ void startWebserver()
  */
 void stopWebserver()
 {
+    // startWebserver() calls this every loop pass without an IP (WEB-STOP-01)
+    if (!webStopShouldAct(bweb_server_running))
+        return;
+
 #ifdef ESP32
     MDNS.end();
     web_server.stop();
@@ -343,95 +455,14 @@ void loopWebserver()
  */
 void web_client_html(CommonWebClient web_client)
 {
-    IPAddress web_ip_now = web_client.remoteIP();
-    char c_web_ip_now[20];
-    snprintf(c_web_ip_now, sizeof(c_web_ip_now), "%i.%i.%i.%i", web_ip_now[0], web_ip_now[1], web_ip_now[2], web_ip_now[3]);
-
-    if(bDEBUG) {
+    if (bDEBUG)
+    {
         Serial.print("[Web]...Client IP: ");
-    if(bDEBUG) {
-        Serial.print("[Web]...Client IP: ");
-        Serial.println(web_ip_now);
+        Serial.println(web_client.remoteIP());
     }
-    }
-    bool bPasswordOk = false;
 
-    // check password used
-    int inext_free = -1;
-    int iwebid = -1;
-
-    if (strlen(meshcom_settings.node_webpwd) > 0)
-    {
-        for (int iwid = 0; iwid < 10; iwid++)
-        {
-            // check passwort Time expired 4h
-            if((uint32_t)(millis() - (uint32_t)web_ip_passwd_time[iwid]) >= (1000U * 60 * 60 * 4))
-            {
-                web_ip_passwd_time[iwid] = 0;
-                memset(web_ip[iwid], 0x00, sizeof(web_ip[iwid]));
-            }
-
-            // check timeout
-            if (web_ip_passwd_time[iwid] > 0)
-            {
-                if (bDEBUG)
-                    Serial.printf("iwid:%i web_ip[iwid]:%s %s\n", iwid, web_ip[iwid], c_web_ip_now);
-
-                if (is_equ(web_ip[iwid], c_web_ip_now))
-                {
-                    bPasswordOk = true;
-                    web_ip_passwd_time[iwid] = millis();
-                    iwebid = iwid;
-                }
-            }
-            else
-            {
-                if (inext_free < 0)
-                    inext_free = iwid;
-            }
-        }
-
-        if(inext_free < 0)
-        {
-            Serial.print(getTimeString());
-            Serial.printf(" WEBServer not free IP/Password table\n");
-        }
-        else
-        {
-            if (!bPasswordOk)
-            {
-                String strGetPassword = work_webpage(true, inext_free);
-
-                if (is_equ(strGetPassword.c_str(), meshcom_settings.node_webpwd))
-                {
-                    Serial.print(getTimeString());
-                    Serial.printf(" WEBServer Password OK IP:<%s pos:%i>\n", c_web_ip_now, inext_free);
-
-                    snprintf(web_ip[inext_free], sizeof(web_ip[inext_free]), "%s", c_web_ip_now);
-                    web_ip_passwd_time[inext_free] = millis();
-                    bPasswordOk = true;
-                    iwebid = inext_free;
-                }
-                else
-                {
-                    Serial.print(getTimeString());
-                    Serial.printf(" WEBServer Password not found IP:<%s> show LOGIN\n", c_web_ip_now);
-                }
-            }
-        }
-    }
-    else
-        bPasswordOk = true;
-        
-    // no connection via password or no password need
-    if (!bPasswordOk)
-    {
-        work_webpage(true, inext_free);
-    }
-    else
-    {
-        work_webpage(false, iwebid);
-    }
+    // WEB-AUTH-01: the login state is a session cookie, checked in work_webpage()
+    work_webpage();
 }
 
 /**
@@ -495,8 +526,11 @@ static int web_read_body(long content_length)
 
     long          got = 0;
     unsigned long last = millis();
+    const unsigned long start = last;
 
-    while (got < content_length && (millis() - last) <= WEB_TIMEOUT_TIME)
+    // Total deadline as well as the idle one: a client dripping one byte per
+    // ~2 s would otherwise pin the loop task past the 5 s ESP32 task WDT.
+    while (got < content_length && (millis() - last) <= WEB_TIMEOUT_TIME && (millis() - start) <= 4000UL)
     {
         yield();
 
@@ -518,6 +552,168 @@ static int web_read_body(long content_length)
     web_cfg_buf[got] = '\0';
 
     return (got == content_length) ? (int)got : -3;
+}
+
+/**
+ * ###########################################################################################################################
+ * RM-09 / W2 (#1189): remote management web endpoints -- POST /rmsend and GET /rmstatus.
+ *
+ * Both run in the loop task (the ESP32 and the nRF52 web server are both driven from there), which is
+ * what the rm_runtime.h sender/status API requires.
+ *
+ * W2-1: the TARGET's password travels in the BODY of POST /rmsend only. It is therefore never part of a
+ * request line, so it never reaches web_header or web_currentLine (the request-line Strings), the bDEBUG
+ * request echo in work_webpage() (that one is switched off for /rmsend anyway), /setparam, /callfunction or
+ * any param print. The handler reads the body straight from the socket into ONE fixed stack buffer, parses
+ * it in place, hands the password pointer to rmSendCommand() (no copy there either) and wipes the buffer
+ * with volatile stores before it returns.
+ */
+
+/** POST /rmsend   body: dst=<call>&pw=<target password>&cmd=<cmd>&args=<args>   (all percent-encoded)
+ *             or: slot=<0..2>&cmd=<cmd>&args=<args>   (a saved node: its key comes from the store, never a password)
+ *             optional &force=1: use the one "try once more" after a re-key (only where canForce is reported)
+ *             optional &call=<CALL> (slot form only): refused with "slot" unless the slot holds exactly that call
+ *  answer: {"ok":true,"ctr":N[,"viaSync":true]} or {"ok":false,"err":"<reason>","msg":"<sentence>","retry":S,"canForce":0|1}
+ *  err "range" (txpower outside the range learnt for that target) adds "range":"<min>..<max>"
+ *  -- never an echo of any input */
+static void sub_rm_send(long content_length)
+{
+    char body[RM_FORM_BODY_MAX + 1];
+    char err[16] = {0};
+    uint32_t ctr = 0;
+    bool ok = false;
+    bool viaSync = false; // RM GUI W1b: the command waits behind an automatic sync (ctr 0)
+    uint32_t retryS = 0;  // refusal only: seconds until the target accepts a send again
+    bool canForce = false; // refusal only: the one "try once more" after a re-key is available (force=1)
+    char rangeDst[16] = {0}; // refusal "range" only: the target call, copied before the body is wiped
+
+    body[0] = '\0';
+
+    // RM GUI W2a: shared absolute-deadline body read and the pure parser (web_rm_parse.h)
+    const char *e = rmReadBody(body, sizeof(body), content_length);
+    if (e != nullptr)
+        snprintf(err, sizeof(err), "%s", e);
+    else
+    {
+        const RmSendReq q = rmParseSendBody(body);
+        if (q.err != nullptr)
+            snprintf(err, sizeof(err), "%s", q.err);
+        else if (q.slot >= 0)
+        {
+            ok = rmSendBySlot(q.slot, q.cmd, q.args, err, sizeof(err), &ctr, &viaSync, q.force, q.call);
+            if (!ok)
+                rmSlotTargetInfo(q.slot, &retryS, &canForce, rangeDst, sizeof(rangeDst));
+        }
+        else
+        {
+            ok = rmSendCommand(q.dst, q.pw, q.cmd, q.args, err, sizeof(err), &ctr, &viaSync, q.force);
+            if (!ok)
+            {
+                rmTargetMaySend(q.dst, &retryS, &canForce);
+                snprintf(rangeDst, sizeof(rangeDst), "%s", q.dst != nullptr ? q.dst : "");
+            }
+        }
+    }
+
+    rm_wipe(body, sizeof(body)); // dst/pw/cmd/args point into it: the password is gone from here on
+
+    send_http_header(ok ? 200 : 422, RESPONSE_TYPE_JSON);
+    if (ok)
+        web_client.printf("{\"ok\":true,\"ctr\":%lu%s}\n", (unsigned long)ctr, viaSync ? ",\"viaSync\":true" : "");
+    else
+    {
+        const char *tok = err[0] ? err : "send";
+        web_client.print("{\"ok\":false,\"err\":");
+        rm_json_str(tok);
+        web_client.print(",\"msg\":");
+        rm_json_str(rmErrTokenMessage(tok)); // the sentence comes from rmTokenTable, the JS keeps no copy
+        int rMin = 0, rMax = 0;
+        if (strcmp(tok, "range") == 0 && rmTargetTxRange(rangeDst, &rMin, &rMax))
+            web_client.printf(",\"range\":\"%d..%d\"", rMin, rMax); // the txpower range learnt for that target
+        web_client.printf(",\"retry\":%lu,\"canForce\":%d}\n", (unsigned long)retryS, canForce ? 1 : 0);
+    }
+}
+
+/** GET /rmstatus -- this node's RM state, the last 5 executed commands, the whole sent book (<= 12) and
+ *  every managed node (distinct dst of the book + the pending chain's target); streamed entry by entry.
+ *  Never a key, a tag or a password. All text is printable ASCII, < > & escaped (rm_json_str).
+ *  {"on":0|1,"pw":0|1,"ok":N,"rej":N,"lock":0|1,"lockS":N,"hwm":N,
+ *   "log":[{"ago":S,"src":"","ctr":N,"cmd":"","res":""},...],
+ *   "sent":[{"dst":"","ctr":N,"cmd":"","ago":S,"rep":0|1,"ver":0|1,"reply":"","st":"queued|waiting|noanswer|ok|err|unverified","msg":""},...],
+ *   "targets":[{"dst":"","locked":0|1,"retry":S,"canForce":0|1,"pending":0|1,"chainErr":null|"token","chainMsg":null|"sentence"},...]} */
+static void sub_rm_status(void)
+{
+    const uint32_t now = (uint32_t)millis();
+
+    send_http_header(200, RESPONSE_TYPE_JSON);
+
+    {
+        RmStatusHead st;
+        rmGetStatusHead(st);
+        const unsigned long rej = (unsigned long)st.stats.rej_format + st.stats.rej_tag + st.stats.rej_replay +
+                                  st.stats.rej_blocked + st.stats.rej_rate + st.stats.rej_lockout + st.stats.rej_disabled;
+        web_client.printf("{\"on\":%d,\"pw\":%d,\"ok\":%lu,\"rej\":%lu,\"lock\":%d,\"lockS\":%lu,\"hwm\":%lu,\"log\":[",
+                          st.on ? 1 : 0, st.passwdSet ? 1 : 0, (unsigned long)st.stats.ok, rej, st.lockActive ? 1 : 0,
+                          (unsigned long)st.lockRemainS, (unsigned long)st.hwm);
+        RmLogEntry le; // one entry at a time (P10): no copy of the whole log on the stack
+        for (uint8_t i = 0, shown = 0; i < rmLogCount() && rmLogAt(i, &le); i++, shown++)
+        {
+            web_client.printf("%s{\"ago\":%lu,\"src\":", shown ? "," : "", (unsigned long)((uint32_t)(now - le.ms) / 1000UL));
+            rm_json_str(le.src);
+            web_client.printf(",\"ctr\":%lu,\"cmd\":", (unsigned long)le.ctr);
+            rm_json_str(le.cmd);
+            web_client.print(",\"res\":");
+            rm_json_str(le.result);
+            web_client.print("}");
+        }
+        web_client.print("]");
+    }
+
+    {
+        RmSent sent; // the whole book (<= 12), one entry at a time
+        web_client.print(",\"sent\":[");
+        for (uint8_t i = 0; rmSentAt(i, &sent); i++)
+        {
+            web_client.printf("%s{\"dst\":", i ? "," : "");
+            rm_json_str(sent.dst);
+            web_client.printf(",\"ctr\":%lu,\"cmd\":", (unsigned long)sent.ctr);
+            rm_json_str(sent.cmd);
+            web_client.printf(",\"ago\":%lu,\"rep\":%d,\"ver\":%d,\"reply\":", (unsigned long)((uint32_t)(now - sent.sentMs) / 1000UL),
+                              sent.replied ? 1 : 0, sent.verified ? 1 : 0);
+            rm_json_str(sent.reply);
+            web_client.print(",\"st\":");
+            rm_json_str(sent.stateName);
+            web_client.print(",\"msg\":");
+            rm_json_str(sent.msg);
+            web_client.print("}");
+        }
+        web_client.print("]");
+    }
+
+    {   // RM GUI W1b: per managed node, the sender policy as the GUI needs it (locked after 2 unanswered sends)
+        RmTarget tg; // every distinct dst of the book plus the pending chain's target, one at a time
+        web_client.print(",\"targets\":[");
+        for (uint8_t i = 0; rmTargetAt(i, &tg); i++)
+        {
+            web_client.printf("%s{\"dst\":", i ? "," : "");
+            rm_json_str(tg.dst);
+            web_client.printf(",\"locked\":%d,\"retry\":%lu,\"canForce\":%d,\"pending\":%d,\"chainErr\":", tg.locked ? 1 : 0,
+                              (unsigned long)tg.retryS, tg.canForce ? 1 : 0, tg.pending ? 1 : 0);
+            if (tg.chainErr != nullptr)
+                rm_json_str(tg.chainErr);
+            else
+                web_client.print("null");
+            web_client.print(",\"chainMsg\":");
+            if (tg.chainMsg != nullptr)
+                rm_json_str(tg.chainMsg);
+            else
+                web_client.print("null");
+            web_client.print("}");
+        }
+        web_client.print("]");
+    }
+
+    web_client.println("}");
 }
 
 /**
@@ -564,7 +760,8 @@ static void sub_config_download(void)
     web_client.println("Content-type:application/json");
     web_client.printf("Content-Disposition: attachment; filename=\"meshcom-%s.json\"\n", fname);
     web_client.printf("Content-Length: %u\n", (unsigned int)n);
-    web_client.println("Access-Control-Allow-Origin: *");
+    if (web_cors_ok)
+        web_client.println("Access-Control-Allow-Origin: *");
     web_client.println("Connection: close");
     web_client.println("Cache-Control: no-cache, no-store, must-revalidate");
     web_client.println("Pragma: no-cache");
@@ -620,6 +817,19 @@ static void sub_config_upload(long content_length)
         return;
     }
 
+    // Production lock: a file from an earlier build may hold values the setters refuse now (ptime 1800,
+    // pingmax 100, locked spectrum/NBR values). The import accepts them; repair before they are persisted.
+    {
+#if defined(NRF52_SERIES)
+        const bool hasAu = false;
+#else
+        const bool hasAu = true;
+#endif
+        const int locked = prodLockNormalise(meshcom_settings, INSTRUMENT_ENABLED != 0, hasAu);
+        if(locked > 0)
+            Serial.printf("[CONFIG];import;normalised;%d\n", locked);
+    }
+
     save_settings();
 
     send_http_header(200, RESPONSE_TYPE_TEXT);
@@ -645,7 +855,8 @@ static void sub_config_upload(long content_length)
  * ###########################################################################################################################
  * Handle Web requests and call the matching sub function
  */
-String work_webpage(bool bget_password, int webid)
+
+void work_webpage(void)
 {
     // RAM-Rueckgewinn (2026-09-20): der 1-kB-Sammelpuffer web_header_collect
     // lag als statisches Feld im DRAM und wurde am Ende ohnehin in den String
@@ -662,13 +873,20 @@ String work_webpage(bool bget_password, int webid)
 
     web_currentTime = millis();
     web_previousTime = web_currentTime;
-    String password_message = "";
     String web_currentLine = ""; // make a String to hold incoming data from the client
 
     // CS-03: an upload needs its body length, and the header may well be
     // longer than WEB_HEADER_MAX. Picked off the line as it completes,
     // so it does not depend on that 1 kB window.
     long web_content_length = -1;
+    bool web_rm_quiet = false; // W2-1: set once the request line is /rmsend, suppresses the bDEBUG echo
+                               // (WEB-AUTH-01: also /?login= and the legacy /?nodepassword=)
+    bool web_line_quiet = false; // WEB-AUTH-01: the current line is the Cookie header, not echoed
+    // WEB-AUTH-01: Cookie header value, captured as its line completes (it often arrives behind the
+    // WEB_HEADER_MAX window of web_header)
+    char web_cookie[256];
+    size_t web_cookie_len = 0;
+    web_cookie[0] = 0;
 
     if (bDEBUG)
     {
@@ -687,11 +905,22 @@ String work_webpage(bool bget_password, int webid)
             // if there's bytes to read from the client,
             char c = web_client.read(); // read a byte, then
 
-            if (bDEBUG)
-                Serial.write(c); // print it out the serial monitor
-
             if (web_header.length() < WEB_HEADER_MAX)
                 web_header += c;
+
+            // W2-1: nothing of a /rmsend request is echoed to the serial monitor (its body is never
+            // read here, but a GET variant would carry the target password in the request line)
+            if (!web_rm_quiet && ((web_header.length() == 8 && web_header.startsWith("POST /rm")) ||
+                                  (web_header.length() == 7 && web_header.startsWith("GET /rm"))))
+                web_rm_quiet = true; // /rmsend, /rmpasswd, /rmnodes, ... (RM GUI W2 adds more /rm* paths)
+            if (!web_rm_quiet && ((web_header.length() == 12 && web_header.startsWith("GET /?login=")) ||
+                                  (web_header.length() == 19 && web_header.startsWith("GET /?nodepassword="))))
+                web_rm_quiet = true; // WEB-AUTH-01: login argument / legacy plaintext password
+            if (web_currentLine.length() == 7 && web_currentLine.equalsIgnoreCase("cookie:"))
+                web_line_quiet = true; // WEB-AUTH-01: session token
+
+            if (bDEBUG && !web_rm_quiet && (!web_line_quiet || c == '\n'))
+                Serial.write(c); // print it out the serial monitor
 
             if (c == '\n')
             {
@@ -702,25 +931,113 @@ String work_webpage(bool bget_password, int webid)
                 {
                     // Serial.println(web_header);
 
-                    // user sends authentication
-                    if (web_header.indexOf("/?nodepassword") >= 0)
+                    // RM GUI W1c: refuse DNS-rebinding Hosts and cross-site browser requests before any
+                    // routing -- /setparam, /callfunction, /rmsend ... are plain GETs a foreign page could
+                    // fire with an <img>. curl/python tools send no Sec-Fetch-Site and an IP/.local Host.
+                    // Must run before the login routes below (WEB-AUTH-01), which wipe web_header.
+                    String wg_path = "/";
                     {
-                        web_header = web_header.substring(web_header.indexOf("/?nodepassword=") + 15, web_header.indexOf("HTTP/1.1"));
-                        web_header.trim();
-                        if (web_header.length() == 0)
+                        int wa = web_header.indexOf(' ');
+                        int wb = (wa >= 0) ? web_header.indexOf(' ', wa + 1) : -1;
+                        if (wa >= 0 && wb > wa)
+                            wg_path = web_header.substring(wa + 1, wb);
+                    }
+                    // MC_WEB_GUARD=0 (default): only requests the router sends to an RM handler are
+                    // guarded; the rest behaves like upstream (no checks, CORS "*"). Decided on the
+                    // header, the way the router matches (web_guard.h).
+                    const bool wg_on = webGuardRequestApplies(web_header.c_str(), web_header.length(), wg_path.c_str());
+                    const WebGuardVerdict wgv = wg_on ? webGuardCheck(web_header.c_str(), web_header.length(), wg_path.c_str()) : WG_OK;
+                    web_cors_ok = wg_on ? webGuardCorsAllowed(wg_path.c_str(), web_header.startsWith("POST")) : true;
+                    if (wgv != WG_OK)
+                    {
+                        if (bDEBUG)
+                            Serial.printf("[WEB];guard;%s\n", wgv == WG_BAD_HOST ? "bad_host" : "cross_site");
+                        rm_wipe_string(web_header);
+                        rm_wipe_string(web_currentLine);
+                        web_cors_ok = false;
+                        send_http_header(403, RESPONSE_TYPE_JSON);
+                        web_client.println("{\"ok\":false,\"err\":\"forbidden\"}");
+                        web_client.stop();
+                        continue;
+                    }
+
+                    // WEB-AUTH-01: login routes (Web-API_documentation.txt "Login"), after the guard and before the auth gate
+                    if (wg_path.startsWith("/?loginnonce"))
+                    {
+                        char nonce[33];
+                        if (webAuthIssueNonce(millis(), web_auth_rng, nonce))
                         {
-                            web_ip_passwd_time[webid] = 0; // logging out
-                            if (bDEBUG)
-                                Serial.println("WebUI requested logout");
+                            send_http_header(200, RESPONSE_TYPE_TEXT);
+                            web_client.print(nonce);
                         }
                         else
                         {
-                            password_message = decodeURLPercentCoding(web_header); // try logging in using password
-                            if (bDEBUG)
-                                Serial.println("WebUI requested login");
+                            send_http_header(403, RESPONSE_TYPE_JSON);
+                            web_client.println("{\"ok\":false,\"err\":\"throttled\"}");
                         }
-                        send_http_header(200, RESPONSE_TYPE_TEXT);
+                        web_client.stop();
+                        continue;
                     }
+                    if (wg_path.startsWith("/?login="))
+                    {
+                        String wa_arg = wg_path.substring(8);
+                        int wa_amp = wa_arg.indexOf('&');
+                        if (wa_amp >= 0)
+                            wa_arg = wa_arg.substring(0, wa_amp);
+                        char token[33];
+                        char wa_ip[20];
+                        WebAuthResult war = webAuthLogin(wa_arg.c_str(), wa_arg.length(), meshcom_settings.node_webpwd, millis(),
+                                                         web_auth_rng, token);
+                        if (war == WA_OK)
+                        {
+                            char hdr[96];
+                            snprintf(hdr, sizeof(hdr), "Set-Cookie: mcs=%s; Path=/; HttpOnly; SameSite=Strict", token);
+                            send_http_header(200, RESPONSE_TYPE_JSON, hdr);
+                            web_client.println("{\"ok\":true}");
+                            memset(hdr, 0, sizeof(hdr));
+                            memset(token, 0, sizeof(token));
+                            Serial.print(getTimeString());
+                            Serial.printf(" WEBServer Password OK IP:<%s>\n", web_remote_ip(wa_ip, sizeof(wa_ip)));
+                        }
+                        else
+                        {
+                            send_http_header(403, RESPONSE_TYPE_JSON);
+                            web_client.printf("{\"ok\":false,\"err\":\"%s\"}\n", webAuthErrCode(war));
+                            Serial.print(getTimeString());
+                            Serial.printf(" WEBServer Password rejected (%s) IP:<%s>\n", webAuthErrCode(war),
+                                          web_remote_ip(wa_ip, sizeof(wa_ip)));
+                        }
+                        rm_wipe_string(wa_arg);
+                        rm_wipe_string(wg_path);
+                        rm_wipe_string(web_header);
+                        rm_wipe_string(web_currentLine);
+                        web_client.stop();
+                        continue;
+                    }
+                    if (wg_path.startsWith("/?logout") || wg_path == "/?nodepassword=" || wg_path == "/?nodepassword")
+                    {
+                        webAuthLogout(web_cookie, web_cookie_len);
+                        send_http_header(200, RESPONSE_TYPE_TEXT, "Set-Cookie: mcs=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
+                        if (bDEBUG)
+                            Serial.println("WebUI requested logout");
+                        web_client.stop();
+                        continue;
+                    }
+                    if (wg_path.startsWith("/?nodepassword="))
+                    {
+                        // legacy plaintext login: refused, the value is neither used nor logged
+                        rm_wipe_string(wg_path);
+                        rm_wipe_string(web_header);
+                        rm_wipe_string(web_currentLine);
+                        send_http_header(403, RESPONSE_TYPE_JSON);
+                        web_client.println("{\"ok\":false,\"err\":\"plaintext\"}");
+                        web_client.stop();
+                        continue;
+                    }
+
+                    // WEB-AUTH-01: a password is set and the request carries no live session cookie
+                    const bool bget_password = strlen(meshcom_settings.node_webpwd) > 0 &&
+                                               !webAuthSessionValid(web_cookie, web_cookie_len, millis());
 
                     // in every other case, we check if authentication is required but not yet provided
                     if (bget_password)
@@ -738,13 +1055,60 @@ String work_webpage(bool bget_password, int webid)
                         }
                         else
                         {
+                            Serial.print(getTimeString());
+                            {
+                                char wa_ip[20];
+                                Serial.printf(" WEBServer no session IP:<%s> show LOGIN\n", web_remote_ip(wa_ip, sizeof(wa_ip)));
+                            }
                             deliver_scaffold(true);
                         }
                     }
                     else
                     {
 
-                        if (web_header.indexOf("/callfunction/") >= 0)
+                        if (web_header.startsWith("POST /rmsend"))
+                        { // W2-1: remote management send, the password is in the BODY, read by the handler
+                            sub_rm_send(web_content_length);
+                        }
+                        else if (web_header.startsWith("GET /rmsend"))
+                        { // W2-1: refused, and the request line is wiped in case it carried a password
+                            rm_wipe_string(web_header);
+                            send_http_header(405, RESPONSE_TYPE_JSON);
+                            web_client.println("{\"ok\":false,\"err\":\"use POST\"}");
+                        }
+                        else if (web_header.startsWith("GET /rmstatus"))
+                        { // W2: status + sent list for the remote management card
+                            sub_rm_status();
+                        }
+                        else if (web_header.startsWith("POST /rmpasswd"))
+                        { // RM GUI: set / clear node_passwd, the password is in the BODY
+                            sub_rm_passwd(web_content_length);
+                        }
+                        else if (web_header.startsWith("GET /rmnodes"))
+                        { // RM GUI: the three saved nodes (slot, used, call), never a key
+                            sub_rm_nodes_get();
+                        }
+                        else if (web_header.startsWith("POST /rmnodes"))
+                        { // RM GUI: save / delete / forget saved nodes, the password is in the BODY
+                            sub_rm_nodes_post(web_content_length);
+                        }
+                        else if (web_header.startsWith("GET /rmheard"))
+                        { // RM GUI: up to 12 heard nodes for the Remote page chips
+                            sub_rm_heard();
+                        }
+                        else if (web_header.indexOf("/?page=remote") >= 0)
+                        { // RM GUI: the Remote page
+                            send_http_header(200, RESPONSE_TYPE_TEXT);
+                            sub_page_remote();
+                        }
+#if defined(ESP32)
+                        else if (web_header.startsWith("GET /austatus"))
+                        { // AU web GUI: read-only update state for the Info page row, no CORS (node-local)
+                            web_cors_ok = false;
+                            sub_au_status();
+                        }
+#endif
+                        else if (web_header.indexOf("/callfunction/") >= 0)
                         { // user requested to invoke a function
                             // ### !!function will generate a HTML header itself
                             call_function(web_header);
@@ -869,6 +1233,31 @@ String work_webpage(bool bget_password, int webid)
                             web_content_length = web_currentLine.substring(15).toInt();
                     }
 
+                    if (web_line_quiet)
+                    {
+                        // WEB-AUTH-01: keep our "mcs=" pair of the Cookie header in its own bounded buffer
+                        // (found anywhere in the line, so foreign cookies of the same host cannot push it
+                        // out; a second Cookie header without "mcs=" keeps the first one's value)
+                        web_line_quiet = false;
+                        int k = 6;
+                        while ((k = web_currentLine.indexOf("mcs=", k + 1)) >= 0 &&
+                               !(web_currentLine[k - 1] == ':' || web_currentLine[k - 1] == ' ' || web_currentLine[k - 1] == ';'))
+                            ;
+                        if (k >= 0)
+                        {
+                            web_cookie_len = 0;
+                            for (; k < (int)web_currentLine.length() && web_currentLine[k] != ';' &&
+                                   web_cookie_len < sizeof(web_cookie) - 1; k++)
+                                web_cookie[web_cookie_len++] = web_currentLine[k];
+                            web_cookie[web_cookie_len] = 0;
+                        }
+                        rm_wipe_string(web_currentLine);
+                    }
+
+                    if (web_currentLine.startsWith("GET /rmsend") || web_currentLine.startsWith("GET /?nodepassword=") ||
+                        web_currentLine.startsWith("GET /?login="))
+                        rm_wipe_string(web_currentLine); // W2-1: never leave a password in a freed String
+
                     web_currentLine = "";
                 }
             }
@@ -888,7 +1277,7 @@ String work_webpage(bool bget_password, int webid)
         #endif
     }
 
-    return password_message;
+    memset(web_cookie, 0, sizeof(web_cookie));
 }
 
 /**
@@ -902,6 +1291,123 @@ String decodeURLPercentCoding(String input)
     url_percent_decode(buf.data(), input.length()); // NUL-terminates, drops %00
     return String(buf.data());
 }
+
+#if defined(ESP32)
+// AU web GUI: hooks of the shared loadPage() string; empty on the RAK so nRF52 gains no AU bytes.
+#define AU_LP_LEAVE "if(typeof auPageLeave=='function')auPageLeave();"
+#define AU_LP_INIT "if(page=='info'&&cpage=='info'&&typeof auPageInit=='function')auPageInit();"
+#else
+#define AU_LP_LEAVE ""
+#define AU_LP_INIT ""
+#endif
+
+#if defined(ESP32)
+/**
+ * Scaffold JS of the Info page "Auto update" row (campaign-au-webgui-ux): one renderer driven by GET /austatus.
+ * Lives in the scaffold because the sub-pages are injected with innerHTML (a <script> inside never runs);
+ * loadPage() calls auPageLeave() / auPageInit(). The state selector and the error table mirror
+ * au_ui_state.h (auUiState, auErrText); a host harness runs this code against its golden strings.
+ */
+static void auScaffoldJs()
+{
+    web_client.println("var auS=null,auF=null,auBusy=false,auLoc='',auShown=false,auInfl=false,auFInfl=false,auFPct=0,auFMsg='',auFDead=false,auUpAt=0,auT={poll:0,tick:0};");
+    web_client.println("function auEl(i){return document.getElementById(i);}");
+    web_client.println("function auKey(){return 'auF:'+location.host;}");
+    web_client.println("function auFGet(){try{var v=sessionStorage.getItem(auKey());return v?JSON.parse(v):null;}catch(e){return null;}}");
+    web_client.println("function auFSet(o){try{if(o)sessionStorage.setItem(auKey(),JSON.stringify(o));else sessionStorage.removeItem(auKey());}catch(e){}}");
+    web_client.println("function auReload(){location.reload();}");
+    web_client.println("function auWord(e){return String(e||'').split(' ')[0];}");
+    web_client.println("function auIn(w,l){return l.indexOf(w)>=0;}");
+    web_client.println("function auErrText(job,err){var w=auWord(err),c=job=='check',d=job=='download'||job=='stagelan';");
+    web_client.println("if(auIn(w,['tls','conn','http','begin','timeout']))return 'No connection to GitHub';");
+    web_client.println("if(c&&auIn(w,['short','stall','toobig','chunk','feed','enc','json','noenv','badver']))return 'The release list could not be read';");
+    web_client.println("if(d&&auIn(w,['short','stall','digest','readback','crc','write','enc','feed','chunk']))return 'Download damaged, it was discarded -- try again';");
+    web_client.println("if(d&&auIn(w,['noasset','nodigest']))return 'This release has no image for this board';");
+    web_client.println("if(d&&auIn(w,['notota0','imglen','size','overlap','small','inflate','layout']))return 'This node'+String.fromCharCode(39)+'s partition layout cannot take the image -- use the Webflasher';");
+    web_client.println("if(d&&auIn(w,['erase','noflash','nvs']))return 'Could not write the image to flash';");
+    web_client.println("if(w=='nomem')return 'Not enough free memory for the update';");
+    web_client.println("return 'Update failed';}");
+    web_client.println("function auLowHeap(e){var w=auWord(e);return w=='lowheap'||w=='lowheap_phone'||w=='lowheap_ble_off'||w=='lowheap_tls';}");
+    web_client.println("function auState(s,f){if(!s.sbok)return 'S';if(f)return 'F';");
+    web_client.println("if(s.st=='busy'){if(s.job=='check')return 'B';return s.pct>=100?'d':'D';}");
+    web_client.println("if(s.staged)return 'E';var w=auWord(s.err);");
+    web_client.println("if(w=='lowheap_phone')return s.phone?'G':'g';");
+    web_client.println("if(w=='lowheap_ble_off'||w=='lowheap'||w=='lowheap_tls')return 'H';");
+    web_client.println("if(s.newer&&s.inst)return 'C';return 'A';}");
+    web_client.println("function auDraw(g,m,e,h,lab,act,dis,red){var t=auEl('au_tr'),b=auEl('au_btn');if(!t||!b)return;");
+    web_client.println("t.className=g?'au-green':'';auEl('au_msg').textContent=m;auEl('au_err').textContent=e;auEl('au_hint').textContent=h;");
+    web_client.println("b.textContent=lab;b.className=red?'au-red':'';b.disabled=!!(dis||auBusy);b.setAttribute('data-act',act);}");
+    web_client.println("function auRender(){var s=auS;if(!s)return;var L=auState(s,0),g=0,m='',lab='Check now',act='check',dis=0,red=0,e='',h='';");
+    web_client.println("if(L=='S'){m=s.sbwhy=='dio'?'! Bootloader (DIO) cannot start the Safeboot: renew bootloader and Safeboot with the Webflasher':'! Use Webflasher to renew Auto Update aware Safeboot';dis=1;}");
+    web_client.println("else if(L=='B'){lab='Checking now ...';dis=1;}");
+    web_client.println("else if(L=='D'){g=1;m='Firmware '+s.avail+' available';lab='Downloading now ... '+s.pct+' %';dis=1;}");
+    web_client.println("else if(L=='d'){g=1;lab='Verifying download ...';dis=1;}");
+    web_client.println("else if(L=='E'){g=1;m='Firmware '+s.staged+' downloaded and verified';lab='Install now';act='apply';red=1;}");
+    web_client.println("else if(L=='G'){m='! A connected phone uses the memory the update needs';lab='Pause Bluetooth and check';act='ble';}");
+    web_client.println("else if(L=='g'){m='The phone has disconnected -- check again';}");
+    web_client.println("else if(L=='H'){m='! Not enough free memory for the update. Reboot the node and try again.';}");
+    web_client.println("else if(L=='C'){g=1;m='Firmware '+s.avail+' available';lab='Install';act='install';}");
+    web_client.println("else{m=s.newer&&!s.inst?'Firmware '+s.avail+' exists, but has no image for this board':(s.avail?'up to date':'available none');}");
+    web_client.println("if((L=='A'||L=='C'||L=='E')&&(auLoc||(s.err&&!auLowHeap(s.err))))e=auLoc||auErrText(s.job,s.err)+' ['+s.err+']';");
+    web_client.println("var r=auEl('au_row');if(s.phone&&(L=='A'||L=='C')&&!e&&r&&r.getAttribute('data-blepause')=='1')h='(i) A connected phone may block the update on this board';");
+    // BLE guard (section 7): the phone link is dropped for the job; the row says so until the guard is released
+    web_client.println("if(s.guard&&L!='S'&&L!='E'){m='Bluetooth paused for the update';e='';h='';dis=1;act='none';if(L!='B'&&L!='D'&&L!='d')lab='Checking now ...';}");
+    web_client.println("auDraw(g,m,e,h,lab,act,dis,red);}");
+    web_client.println("function auSched(){clearTimeout(auT.poll);auT.poll=0;if(!auShown||!auS||auF)return;var L=auState(auS,0),ms=0;");
+    web_client.println("if(auS.st=='busy'||auS.guard)ms=1000;else if(L=='G')ms=10000;");
+    web_client.println("if(ms)auT.poll=setTimeout(auFetch,ms);}");
+    web_client.println("function auFetch(){if(!auShown)return;if(cpage!='info'||!auEl('au_row')){auPageLeave();return;}if(auInfl)return;auInfl=true;");
+    web_client.println("fetch('/austatus').then(function(r){if(r.status==404){var t=auEl('au_tr');if(t)t.style.display='none';return null;}if(!r.ok)throw 0;return r.json();}).then(function(j){auInfl=false;");
+    web_client.println("if(!auShown||!j)return;if(cpage!='info'||!auEl('au_row')){auPageLeave();return;}auApply(j);}).catch(function(){auInfl=false;auBusy=false;auRender();auSched();if(auShown&&!auF&&!auT.poll)auT.poll=setTimeout(auFetch,5000);});}");
+    web_client.println("function auApply(s){auS=s;auUpAt=Date.now();auBusy=false;auRender();auSched();}");
+    web_client.println("function auClick(){if(auBusy||auF||!auS)return;var b=auEl('au_btn'),a=b?b.getAttribute('data-act'):'';if(!a||b.disabled)return;");
+    web_client.println("auBusy=true;b.disabled=true;auLoc='';var fn=a=='apply'?'updapply':(a=='install'?'updinstall':'updcheck'),p=a=='ble'?'ble':'',tag=auS.staged;");
+    web_client.println("fetch('/callfunction/?'+fn+'='+p).then(function(r){return r.json();}).then(function(j){");
+    web_client.println("if(a=='apply'&&j[fn]=='ok'){auFBegin({tag:tag,t0:Date.now(),etaS:auS.etaS||35,upBase:typeof auS.up=='number'?auS.up:undefined,upAt:auUpAt,img:typeof auS.img=='string'?auS.img:undefined});return;}");
+    web_client.println("if(j[fn]!='ok')auLoc=a=='apply'?'Install of '+tag+' failed':'The node did not start the job, try again in a minute';");
+    web_client.println("auInfl=false;auFetch();}).catch(function(){auBusy=false;auLoc='No answer from the node';auRender();});}");
+    web_client.println("function auFBegin(o){auF=o;auFDead=false;auFSet(o);auBusy=false;clearTimeout(auT.poll);clearInterval(auT.tick);auFPct=0;auFMsg='';auFDraw();auT.tick=setInterval(auFTick,1000);}");
+    web_client.println("function auFDraw(){if(!auF)return;var el=(Date.now()-auF.t0)/1000,m=auFMsg||('Installing '+auF.tag+', the node restarts ...');");
+    web_client.println("if(!auFMsg&&el>180+auF.etaS)m='The node is not back yet. Check its display and power; reload this page when it is up.';");
+    web_client.println("auDraw(1,m,'','',auFDead?'Install failed':'Installing now ... '+auFPct+' %','none',1,0);}");
+    web_client.println("function auFTick(){if(!auF)return;if(cpage!='info'||!auEl('au_row')){auPageLeave();return;}");
+    web_client.println("var el=(Date.now()-auF.t0)/1000,p=Math.min(95,Math.floor(el/auF.etaS*100));if(p>auFPct)auFPct=p;auFDraw();");
+    web_client.println("if(el>=Math.max(auF.etaS-10,8)&&Math.floor(el)%2==0)auFProbe();}");
+    web_client.println("function auFProbe(){if(auFInfl)return;auFInfl=true;");
+    // a firmware without the /austatus route answers the Info scaffold (2xx HTML with "cpage=") on /austatus and /ota/state:
+    // the node is demonstrably up, so that counts as back. Safeboot answers /ota/state with JSON; a redirect page has no "cpage=".
+    web_client.println("var auSc=false;");
+    web_client.println("fetch('/austatus').then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){var j=null;try{j=JSON.parse(t);}catch(e){}");
+    web_client.println("if(j&&typeof j.run=='string'){auFInfl=false;auFJson(j);return;}auSc=t.indexOf('cpage=')>=0;throw 0;}).catch(function(){");
+    web_client.println("fetch('/ota/state').then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){var o=null;try{o=JSON.parse(t);}catch(e){}");
+    web_client.println("auFInfl=false;if(o){auFOta(o);return;}if(auSc&&auF){auFDone();return;}throw 0;}).catch(function(){auFInfl=false;});});}");
+    web_client.println("function auFDone(){auFPct=100;auFDraw();auFSet(null);clearInterval(auT.tick);auF=null;auReload();}");
+    web_client.println("function auFRestarted(j){return typeof j.up=='number'&&typeof auF.upBase=='number'&&j.up+10<auF.upBase+(Date.now()-auF.upAt)/1000;}");
+    // run "local": a Safeboot fallback also restarts the node, so with "img" on both sides only a changed image id is success
+    web_client.println("function auFNewImg(j){if(typeof j.img=='string'&&typeof auF.img=='string')return j.img!=auF.img;return auFRestarted(j);}");
+    web_client.println("function auFJson(j){if(!auF)return;if(j.run==auF.tag||(j.run=='local'&&auFNewImg(j))){auFDone();return;}");
+    web_client.println("auFSet(null);clearInterval(auT.tick);auT.tick=0;auF=null;auFMsg='';");
+    web_client.println("if(j.sbok){auLoc='Install failed, the old firmware is running';}");
+    web_client.println("auApply(j);}");
+    // apply_failed: with fallback_in_ms >= 0 Safeboot counts down to the old firmware; with a negative value or app_valid false it has
+    // no app to fall back to and waits for an upload (dead end, the line stays; probing goes on so the page recovers by itself)
+    web_client.println("function auFOta(o){if(!auF||!o)return;auFMsg='';auFDead=false;if(o.reason=='apply_failed'||o.state=='aborted'){");
+    web_client.println("var fb=typeof o.fallback_in_ms=='number'?o.fallback_in_ms:-1;");
+    web_client.println("if(o.app_valid===false||fb<0){auFDead=true;auFMsg='Install failed -- the node stays in Safeboot. Upload a firmware at http://'+location.host+'/update or use the Webflasher';}");
+    web_client.println("else auFMsg='Install failed -- the node returns to the old firmware in '+Math.max(0,Math.ceil(fb/1000))+' s';}");
+    web_client.println("else if(o.state=='applying'&&o.total>0){var p=Math.min(99,Math.floor(o.received*100/o.total));if(p>auFPct)auFPct=p;}");
+    web_client.println("auFDraw();}");
+    // a remembered click counts only for the tag the node still has staged (or already runs); anything else, or a record past its
+    // time budget while the node answers idle, is dropped and the plain base state is drawn
+    web_client.println("function auFStale(f,j){if(j.run==f.tag)return false;if(j.staged!=f.tag)return true;");
+    web_client.println("return j.st!='busy'&&(Date.now()-f.t0)/1000>180+(f.etaS||35)+60;}");
+    web_client.println("function auFInit(f){fetch('/austatus').then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(t){var j=null;try{j=JSON.parse(t);}catch(e){}");
+    web_client.println("if(!auShown||auF)return;if(j&&typeof j.run=='string'&&auFStale(f,j)){auFSet(null);auApply(j);return;}auFBegin(f);}).catch(function(){if(auShown&&!auF)auFBegin(f);});}");
+    web_client.println("function auPageLeave(){clearTimeout(auT.poll);clearInterval(auT.tick);auT.poll=0;auT.tick=0;auShown=false;auInfl=false;auFInfl=false;auBusy=false;auS=null;auF=null;auLoc='';auFMsg='';auFDead=false;auFPct=0;}");
+    web_client.println("function auPageInit(){auPageLeave();var b=auEl('au_btn');if(!b)return;auShown=true;b.onclick=auClick;");
+    web_client.println("var f=auFGet();if(f&&f.tag&&f.t0){auFInit(f);return;}auFetch();}");
+}
+#endif
 
 /**
  * ###########################################################################################################################
@@ -919,6 +1425,11 @@ void deliver_scaffold(bool bget_password)
 
     // ECMA-Script/Javascript
     web_client.println("<script type=\"text/javascript\">\n");
+    // RM GUI: every request of the page carries `X-MC: 1`. The node refuses state-changing requests
+    // (setparam, callfunction, sendmessage, every POST) without it or without a same-host Origin: a foreign
+    // web page cannot set a custom header without a CORS preflight, which the node does not answer.
+    web_client.println("(function(){var f=window.fetch;if(f){window.fetch=function(u,o){o=o||{};var h=new Headers(o.headers||{});h.set('X-MC','1');o.headers=h;return f.call(window,u,o);};}"
+                       "var s=window.XMLHttpRequest&&XMLHttpRequest.prototype.send;if(s){XMLHttpRequest.prototype.send=function(b){try{this.setRequestHeader('X-MC','1');}catch(e){}return s.call(this,b);};}})();");
     // these variables will hold the last loaded page name and sender in order to force a refresh
     web_client.println("cpage=\"info\";csender=undefined;\nsetInterval(autorefresh,30000);");
     // This function will be called in intervalls - can be used to auto-refresh content depending on what page is loaded
@@ -926,10 +1437,10 @@ void deliver_scaffold(bool bget_password)
 #if defined(ENABLE_MSGSTORE)
     web_client.println("function autorefreshMbox(){if(cpage=='mailbox')loadPage('mailbox',csender,false);}setInterval(autorefreshMbox,10000);");
 #endif
-    // this function is used for login and logout
-    web_client.println("function login(pwd){var xhttp = new XMLHttpRequest(); xhttp.onreadystatechange=function(){if(this.readyState==4 && this.status==200){window.location.reload(true);}};xhttp.open(\"GET\",\"?nodepassword=\"+pwd,true);xhttp.send();}\n");
+    // WEB-AUTH-01: login(), logout(), mcLoginFocus() -- challenge-response, must stay after the X-MC wrapper above
+    webLoginScaffoldJs();
     // this function is used to load content depending on the navigation button pressed
-    web_client.println("function loadPage(page,sender,useSpinner) {cpage=page;csender=sender;if(useSpinner){document.getElementById(\"content_layer\").innerHTML=\"<span class=\\\"loader\\\"></span>\"};var xhttp = new XMLHttpRequest(); xhttp.onreadystatechange=function(){if(this.readyState==4 && this.status==200){document.getElementById(\"content_layer\").innerHTML=this.responseText;mcRenderQueue();if(page=='messages' && document.getElementById('messages_panel'))mcRenderHistory();}};xhttp.open(\"GET\",\"?page=\"+page,true);xhttp.send();Array.from(document.querySelectorAll('.nav_button.nbactive ')).forEach((el) => el.classList.remove('nbactive')); sender.classList.add('nbactive');}\n");
+    web_client.println("function loadPage(page,sender,useSpinner) {" AU_LP_LEAVE "if(typeof rmPageLeave=='function')rmPageLeave();cpage=page;csender=sender;if(useSpinner){document.getElementById(\"content_layer\").innerHTML=\"<span class=\\\"loader\\\"></span>\"};var xhttp = new XMLHttpRequest(); xhttp.onreadystatechange=function(){if(this.readyState==4 && this.status==200){document.getElementById(\"content_layer\").innerHTML=this.responseText;if(typeof mcLoginFocus=='function')mcLoginFocus();mcRenderQueue();if(page=='messages' && document.getElementById('messages_panel'))mcRenderHistory();if(page=='remote'&&cpage=='remote')rmPageInit();" AU_LP_INIT "if(page=='setup'&&typeof raSt=='function')raSt();}};xhttp.open(\"GET\",\"?page=\"+page,true);xhttp.send();Array.from(document.querySelectorAll('.nav_button.nbactive ')).forEach((el) => el.classList.remove('nbactive')); sender.classList.add('nbactive');}\n");
     // this function is used to send a message from the browser via node to the mesh
     //
     // BP-09: the input fields used to be cleared unconditionally, right after
@@ -1022,12 +1533,41 @@ void deliver_scaffold(bool bget_password)
     web_client.println("function setvalue(param,value,refresh) {fetch(\"/setparam/?\"+param+\"=\"+encodeURIComponent(value)).then(function(response){return response.json();}).then(function(jsonResponse){if(jsonResponse['returncode']==1)alert(\"Value could not be set.\");if(jsonResponse['returncode']==2)alert(\"Parameter unknown to node.\");if(jsonResponse['returncode']==0){var w=document.getElementById(param+\"_warn\");if(w)w.style.display=(value==\"on\")?\"\":\"none\";}if(jsonResponse['returncode']>0){loadPage(cpage,csender,false)}if(refresh)loadPage(cpage,csender,false);});}\n");
     // this function invokes a function call to the backend passing the function name and an optional parameter (e.g. sendpos)
     web_client.println("function callfunction(functionname,functionparameter){fetch(\"/callfunction/?\"+functionname+\"=\"+functionparameter).then(function(response){return response.json();}).then(function (jsonResponse) {/*Nothing todo yet.*/})}\n");
+#if defined(ESP32)
+    auScaffoldJs(); // AU web GUI: Info page Auto update row
+#endif
     // CS-03: config restore. Lives here and not in the setup page, because the
     // sub-pages are injected with innerHTML -- a <script> inside them never runs.
     web_client.println("function uploadconfig(){var e=document.getElementById(\"cfgfile\");if(!e||e.files.length==0){alert(\"choose a config file first\");return;}if(!confirm(\"Restore this configuration and reboot the node?\"))return;var r=new FileReader();r.onload=function(){fetch(\"/config\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:r.result}).then(function(x){return x.text().then(function(t){var m=t.replace(/<[^>]*>/g,\" \").trim();if(x.ok){alert(\"config imported: \"+m);}else{alert(\"import failed: \"+m);}});}).catch(function(err){alert(\"upload failed: \"+err);});};r.readAsText(e.files[0]);}\n");
 
     // This function is used to toggle a css class so setup cars can collapse / expand
     web_client.println("function togglecard(element){element.parentElement.classList.toggle(\"cardopen\");}");
+
+    // RM GUI W2b: Remote page scripts (state tiles, saved nodes, password, polling). Lives here because
+    // sub-pages are injected with innerHTML and their <script> never runs.
+    rmScaffoldJs();
+
+    // Remote Admin card of the Settings page (sub_page_setup()): scripts of sub-pages never run, so the logic lives here;
+    // loadPage() calls raSt() after the setup fragment is in. Password only in the POST body, never in a URL.
+    // RA-JS-BEGIN
+    web_client.println("var raA=0,raT=0;\n"
+                       "function raM(t,b){var e=rmEl('ra_msg');if(e){e.textContent=t;e.style.color=b?'var(--mcred)':'';}}\n"
+                       "function raX(e,t){raM(e===0?'Log in again to change these settings.':t,1);}\n"
+                       "function raDis(m){clearTimeout(raT);raA=0;var b=rmEl('ra_clr');if(b)b.textContent='Clear';if(m)raM('');}");
+    web_client.println("function raSt(){fetch('/rmstatus').then(rmJson).then(function(j){var o=rmEl('ra_on');if(!o)return;o.checked=!!j.on;o.disabled=!j.pw&&!j.on;\n"
+                       "rmEl('ra_hint').textContent=j.pw?'':'Set a password first, then switch remote management on.';\n"
+                       "rmEl('ra_st').textContent='password: '+(j.pw?'set':'not set')+(j.lock?', a sender is blocked for '+(j.lockS||1)+' s after wrong attempts':'');})\n"
+                       ".catch(function(e){raX(e,'Could not read the state of this node. Reload the page.');});}");
+    web_client.println("function raP(b,t){rmPost('/rmpasswd',b).then(rmJson).then(function(j){if(j&&j.ok)raM(t);else raM(rmErrText(j),1);raSt();})\n"
+                       ".catch(function(e){raX(e,'The node did not answer. Try again.');});}");
+    web_client.println("function raSet(){var i=rmEl('ra_pw'),p=i.value,e=rmPwProblem(p);raDis();\n"
+                       "if(e){raM(e,1);return;}i.value='';raP('act=set&pw='+rmEnc(p),'Password set.');}\n"
+                       "function raClr(){if(!raA){raA=1;rmEl('ra_clr').textContent='Really? tap again';raM('Clear the password? Remote management will be switched off.');raT=setTimeout(function(){raDis(1);},4000);return;}\n"
+                       "raDis();raP('act=clear','Password cleared. Remote management is off.');}");
+    web_client.println("function raOn(){var o=rmEl('ra_on'),v=o.checked?'on':'off';o.disabled=true;fetch('/setparam/?rm='+v).then(rmJson).then(function(j){var k=j&&j.returncode==0;\n"
+                       "raM(k?'Remote management is '+v+'.':'Could not change it. Is a password set?',!k);raSt();})\n"
+                       ".catch(function(e){raX(e,'The node did not answer. Try again.');raSt();});}");
+    // RA-JS-END
 
     // WQ-01: LoRa Queue panel on the rxlog page. rxlog is fetched by loadPage()
     // and injected with innerHTML, which never runs a <script> tag it carries,
@@ -1044,7 +1584,9 @@ void deliver_scaffold(bool bget_password)
     web_client.println("var d=document.getElementById('mcq');");
     web_client.println("if(!d)return;");
     web_client.println("var p=[0,0,0,0,0,0];");
-    web_client.println("for(var i=1;i<=5;i++){p[i]=parseInt(d.getAttribute('data-p'+i))||0;}");
+    web_client.println("var w=[0,0,0,0,0,0];");
+    web_client.println("for(var i=1;i<=5;i++){p[i]=parseInt(d.getAttribute('data-p'+i))||0;w[i]=parseInt(d.getAttribute('data-w'+i))||0;}");
+    web_client.println("var w0=parseInt(d.getAttribute('data-w0'))||0;");
     web_client.println("var ring=parseInt(d.getAttribute('data-ring'))||0;");
     web_client.println("var used=parseInt(d.getAttribute('data-p0'))||0;");
     web_client.println("var bp=parseInt(d.getAttribute('data-bp'))||0;");
@@ -1068,9 +1610,9 @@ void deliver_scaffold(bool bget_password)
     web_client.println("var colors=['#A2182F','#E07B39','#3B7DD8','#6FA96F','#9E9E9E'];");
     web_client.println("var names=['crit','high','normal','low','bg'];");
     web_client.println("var html='';");
-    web_client.println("html+='<div class=font-bold>TX ring</div>';");
+    web_client.println("html+='<div class=font-bold>TX queue</div>';");
     web_client.println("html+='<div class=mcq-barwrap><div class=mcq-bar>';");
-    web_client.println("for(var pr=1;pr<=5;pr++){for(var c=0;c<p[pr];c++){html+='<div class=mcq-cell style=background:'+colors[pr-1]+'></div>';}}");
+    web_client.println("for(var pr=1;pr<=5;pr++){var wn=Math.min(w[pr],p[pr]);for(var c=0;c<p[pr]-wn;c++){html+='<div class=mcq-cell style=background:'+colors[pr-1]+'></div>';}for(var cw=0;cw<wn;cw++){html+='<div class=mcq-cell-wait style=border-color:'+colors[pr-1]+'></div>';}}");
     web_client.println("for(var c2=0;c2<empty;c2++){html+='<div class=mcq-cell-empty></div>';}");
     web_client.println("html+='</div>';");
     web_client.println("html+='<div class=mcq-tick-faint style=left:'+qrsPct+'%></div>';");
@@ -1083,9 +1625,14 @@ void deliver_scaffold(bool bget_password)
     web_client.println("html+='</div>';");
     web_client.println("html+='<div class=mcq-legend>'+used+'/'+ring+' queued&nbsp;|&nbsp;';");
     web_client.println("for(var pr2=1;pr2<=5;pr2++){html+='<span class=mcq-swatch style=background:'+colors[pr2-1]+'></span>'+names[pr2-1]+' '+p[pr2]+' ';}");
+    web_client.println("if(w0>0){html=html.replace(/ +$/,'')+', '+w0+' waiting for ACK';}");
     web_client.println("html+='</div>';");
     web_client.println("var bpcolor=(bp==0)?'#3B9E4F':((bp==1)?'#E07B39':'#A2182F');");
-    web_client.println("html+='<div class=font-bold>Back-pressure: <span style=color:'+bpcolor+'>'+bpname+'</span></div>';");
+    web_client.println("var bptxt=(bp==0)?'accepted':((bp==1)?'slow down':'refused');");
+    web_client.println("html+='<div class=font-bold>Your messages: <span style=color:'+bpcolor+'>'+bptxt+'</span></div>';");
+    web_client.println("var drop=parseInt(d.getAttribute('data-drop'))||0;");
+    web_client.println("var iv=intv*1000;");
+    web_client.println("html+='<div class=font-bold>Queue: '+used+'/'+ring+' queued'+(win?', '+drop+' dropped in the last '+Math.round(intv/60)+' min, TX '+(tx/iv*100).toFixed(1)+' % / RX '+(rx/iv*100).toFixed(1)+' %':'')+'</div>';");
     web_client.println("html+='<div class=font-small>(QRS forecast at&nbsp;'+qrsf+' for your next msgs, line&nbsp;&ge;'+qrs+', QRT at&nbsp;&ge;'+qrt+' of '+ring+')</div>';");
     web_client.println("if(win==0){");
     web_client.println("html+='<div class=font-bold>Dedup window: n/a (no completed 5-min window yet)</div>';");
@@ -1210,6 +1757,7 @@ void deliver_scaffold(bool bget_password)
     web_client.println(".mcq-barwrap {position:relative;}\n");
     web_client.println(".mcq-bar {display:flex;flex-direction:row;gap:1px;height:14px;margin:4px 0 2px 0;}\n");
     web_client.println(".mcq-cell {flex:1;height:14px;}\n");
+    web_client.println(".mcq-cell-wait {flex:1;height:14px;background:#fff;border:2px solid #888;box-sizing:border-box;}\n");
     web_client.println(".mcq-cell-empty {flex:1;height:14px;background:#ECECEC;border:1px solid #d0d0d0;box-sizing:border-box;}\n");
     web_client.println(".mcq-tick {position:absolute;top:0;bottom:0;width:1px;background:#000;opacity:0.5;}\n");
     web_client.println(".mcq-tick-faint {position:absolute;top:0;bottom:0;width:1px;background:#000;opacity:0.15;}\n");
@@ -1230,6 +1778,13 @@ void deliver_scaffold(bool bget_password)
     // stage 3 mailbox card below: "before you switch this on" warning box.
     web_client.println(".cardbody>.grid,.cardbody>.mbx-warn {margin:0 0 7px 0;}\n"); // Store node card: sub-grids inside the single collapsible body
     web_client.println(".mbx-warn {background:var(--mclightred);border:solid 1px var(--mcred);border-radius:5px;padding:6px 8px;margin:7px;}\n");
+#if defined(ESP32)
+    // AU web GUI: Auto update row of the info page: green row, disabled and red (Install now) buttons.
+    web_client.println("#content_inner tr.au-green td {background-color:var(--mclightgreen);}\n");
+    web_client.println("#content_inner button:disabled {opacity:.45;cursor:not-allowed;}\n");
+    web_client.println("#content_inner button.au-red {background-color:var(--mcred);color:#fff;}\n");
+    web_client.println("#au_msg,#au_err {margin:4px 0;}\n#au_hint {color:var(--mcgray);font-size:var(--fs-s);}\n");
+#endif
 
     // content definitions -> mailbox page (stage 3, docs/design/mailbox-page-mockup.html).
     // Kept unconditional (not #if ENABLE_MSGSTORE) because this is a string literal inside
@@ -1296,15 +1851,18 @@ void deliver_scaffold(bool bget_password)
     web_client.print("IuNTE5NzYgOS4xMzA4IDIuNjYyMjcgOS42NjI2NiAyLjk4NTE4IDEwLjA4MzVDMy4xMzI1NiAxMC4yNzU2IDMuMzM5NyAxMC40MzcgMy42NjExOSAxMC42MzlDNC4xMzM4IDEwLjkzNiA0LjQzNzg5IDExLjQ0MTkgNC40Mzc4NiAxMkM0LjQzNzgzIDEyLjU1ODEgNC4xMzM3NSAxMy4wNjM5IDMuNjYxMTggMTMuMzYwOEMzLjMzOTY1IDEzLjU2MjkgMy4xMzI0OCAxMy43MjQ0IDIuOTg1MDggMTMuOTE2NUMyLjY2MjE3IDE0LjMzNzMgMi41MTk2NiAxNC44NjkxIDIuNTg4OSAxNS4zOTVDMi42NDA4MiAxNS43ODk0IDIuODczNzkgMTYuMTkzIDMuMzM5NzMgMTdDMy44MDU2OCAxNy44MDcgNC4wMzg2NSAxOC4yMTA2IDQuMzU0MjYgMTguNDUyN0M0Ljc3NTA4IDE4Ljc3NTYgNS4zMDY5NCAxOC45MTgxIDUuODMyODQgMTguODQ4OUM2LjA3Mjg5IDE4LjgxNzMgNi4zMTYzMiAxOC43MTg2IDYuNjUyMDQgMTguNTQxMkM3LjE0NTQ3IDE4LjI4MDQgNy43MzU1NiAxOC4yNyA4LjIxODkgMTguNTQ5QzguNzAyMjQgMTguODI4MSA4Ljk4ODI2IDE5LjM0NDMgOS4wMDkxMSAxOS45MDIxQzkuMDIzMzEgMjAuMjgxNSA5LjA1OTU3IDIwLjU0MTcgOS4xNTIyMyAyMC43NjU0QzkuMzU1MjIgMjEuMjU1NCA5Ljc0NDU3IDIxLjY0NDggMTAuMjM0NiAyMS44NDc4QzEwLjYwMjIgMjIgMTEuMDY4MSAyMiAxMiAyMkMxMi45MzE5IDIyIDEzLjM5NzggMjIgMTMuNzY1NCAyMS44NDc4QzE0LjI1NTQgMjEuNjQ0OCAxNC42NDQ4IDIxLjI1NTQgMTQuODQ3NyAyMC43NjU0QzE0Ljk0MDQgM");
     web_client.print("jAuNTQxNyAxNC45NzY3IDIwLjI4MTUgMTQuOTkwOSAxOS45MDJDMTUuMDExNyAxOS4zNDQzIDE1LjI5NzcgMTguODI4MSAxNS43ODEgMTguNTQ5QzE2LjI2NDMgMTguMjY5OSAxNi44NTQ0IDE4LjI4MDQgMTcuMzQ3OSAxOC41NDEyQzE3LjY4MzYgMTguNzE4NiAxNy45MjcgMTguODE3MiAxOC4xNjcgMTguODQ4OEMxOC42OTI5IDE4LjkxODEgMTkuMjI0OCAxOC43NzU2IDE5LjY0NTYgMTguNDUyN0MxOS45NjEyIDE4LjIxMDUgMjAuMTk0MiAxNy44MDcgMjAuNjYwMSAxNi45OTk5QzIxLjEyNjEgMTYuMTkyOSAyMS4zNTkxIDE1Ljc4OTQgMjEuNDExIDE1LjM5NUMyMS40ODAyIDE0Ljg2OTEgMjEuMzM3NyAxNC4zMzcyIDIxLjAxNDggMTMuOTE2NEMyMC44Njc0IDEzLjcyNDMgMjAuNjYwMiAxMy41NjI4IDIwLjMzODcgMTMuMzYwOEMxOS44NjYyIDEzLjA2MzkgMTkuNTYyMSAxMi41NTggMTkuNTYyMSAxMS45OTk5QzE5LjU2MjEgMTEuNDQxOCAxOS44NjYyIDEwLjkzNjEgMjAuMzM4NyAxMC42MzkyQzIwLjY2MDMgMTAuNDM3MSAyMC44Njc1IDEwLjI3NTcgMjEuMDE0OSAxMC4wODM1QzIxLjMzNzggOS42NjI3MyAyMS40ODAzIDkuMTMwODcgMjEuNDExMSA4LjYwNDk3QzIxLjM1OTIgOC4yMTA1NSAyMS4xMjYyIDcuODA3MDMgMjAuNjYwMiA3QzIwLjE5NDMgNi4xOTI5NyAxOS45NjEzIDUuNzg5NDUgMTkuNjQ1NyA1LjU0NzI3QzE5LjIyNDkgNS4yMjQzNiAxOC42OTMgNS4wODE4NSAxOC4xNjcxIDUuMTUxMDlDMTcuOTI3MSA1LjE4MjY5IDE3LjY4MzcgNS4y");
     web_client.println("ODEzNiAxNy4zNDc5IDUuNDU4OEMxNi44NTQ1IDUuNzE5NTkgMTYuMjY0NCA1LjczMDAyIDE1Ljc4MTEgNS40NTA5NkMxNS4yOTc3IDUuMTcxOTEgMTUuMDExNyA0LjY1NTY2IDE0Ljk5MDkgNC4wOTc5NEMxNC45NzY3IDMuNzE4NDggMTQuOTQwNCAzLjQ1ODMzIDE0Ljg0NzcgMy4yMzQ2M0MxNC42NDQ4IDIuNzQ0NTggMTQuMjU1NCAyLjM1NTIzIDEzLjc2NTQgMi4xNTIyNFoiIHN0cm9rZT0iI2ZmZmZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiPjwvcGF0aD48L2c+PC9zdmc+\"></Button>\n");
+    web_client.println("<Button class=\"nav_button\" onclick=\"loadPage('remote',this,true)\"><svg viewBox=\"0 0 24 24\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><g stroke=\"#ffffff\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"11\" r=\"2\"></circle><path d=\"M8.5 7.5a5 5 0 0 0 0 7M15.5 7.5a5 5 0 0 1 0 7M5.5 4.5a9 9 0 0 0 0 13M18.5 4.5a9 9 0 0 1 0 13M12 13v8M9 21h6\"></path></g></svg></Button>\n");   // RM GUI W2b: Remote
 
     web_client.println("<Button class=\"nav_button extra_space\" onclick=\"if(confirm('Node will reboot, are you sure?')){callfunction('reboot','');}\"><svg viewBox=\"0 0 16 16\" xmlns=\"http://www.w3.org/2000/svg\"><g stroke-width=\"0\"></g><g stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke=\"#FFFFFF\" stroke-width=\"0.032\"></g><g><path d=\"m 8 0 c -0.550781 0 -1 0.449219 -1 1 v 5 c 0 0.550781 0.449219 1 1 1 s 1 -0.449219 1 -1 v -5 c 0 -0.550781 -0.449219 -1 -1 -1 z m -7 1 l 2.050781 2.050781 c -2.117187 2.117188 -2.652343 5.355469 -1.332031 8.039063 c 1.324219 2.683594 4.214844 4.238281 7.179688 3.851562 c 2.96875 -0.386718 5.367187 -2.625 5.960937 -5.554687 c 0.59375 -2.933594 -0.75 -5.929688 -3.335937 -7.433594 c -0.476563 -0.28125 -1.089844 -0.117187 -1.367188 0.359375 s -0.117188 1.089844 0.359375 1.367188 c 1.851563 1.078124 2.808594 3.207031 2.382813 5.3125 c -0.421876 2.101562 -2.128907 3.691406 -4.253907 3.96875 c -2.128906 0.273437 -4.183593 -0.828126 -5.128906 -2.753907 s -0.566406 -4.226562 0.949219 -5.742187 l 1.535156 1.535156 v -4.003906 c 0 -0.519532 -0.449219 -0.996094 -1 -0.996094 z m 0 0 \" fill=\"#FFFFFF\"></path></g></svg></Button>\n");
 
     // if the suer has set a password, we deliver a logout button
     if (strlen(meshcom_settings.node_webpwd) > 0)
     {
-        web_client.println("<Button class=\"nav_button\" onclick=\"if(confirm('Logging out, are you sure?')){login('')};\"><svg fill=\"#ffffff\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><g stroke-width=\"0\"></g><g stroke-linecap=\"round\" stroke-linejoin=\"round\"></g><g><path d=\"M7.707,8.707,5.414,11H17a1,1,0,0,1,0,2H5.414l2.293,2.293a1,1,0,1,1-1.414,1.414l-4-4a1,1,0,0,1,0-1.414l4-4A1,1,0,1,1,7.707,8.707ZM21,1H13a1,1,0,0,0,0,2h7V21H13a1,1,0,0,0,0,2h8a1,1,0,0,0,1-1V2A1,1,0,0,0,21,1Z\"></path></g></svg></Button>\n");
+        web_client.println("<Button class=\"nav_button\" onclick=\"if(confirm('Logging out, are you sure?')){logout()};\"><svg fill=\"#ffffff\" viewBox=\"0 0 24 24\" xmlns=\"http://www.w3.org/2000/svg\"><g stroke-width=\"0\"></g><g stroke-linecap=\"round\" stroke-linejoin=\"round\"></g><g><path d=\"M7.707,8.707,5.414,11H17a1,1,0,0,1,0,2H5.414l2.293,2.293a1,1,0,1,1-1.414,1.414l-4-4a1,1,0,0,1,0-1.414l4-4A1,1,0,1,1,7.707,8.707ZM21,1H13a1,1,0,0,0,0,2h7V21H13a1,1,0,0,0,0,2h8a1,1,0,0,0,1-1V2A1,1,0,0,0,21,1Z\"></path></g></svg></Button>\n");
     }
-    web_client.printf("</div>\n<div id=\"head_layer\"><p class=\"font-small\">Meshcom 4.0 %s%s</p><p class=\"font-bold\">%s</p></div>\n</div>\n", SOURCE_VERSION, SOURCE_VERSION_WEB_SUB, meshcom_settings.node_call);
+    web_client.printf("</div>\n<div id=\"head_layer\"><p class=\"font-small\">Meshcom %s%s</p><p class=\"font-bold\">%s</p></div>\n</div>\n", SOURCE_VERSION, SOURCE_VERSION_WEB_SUB, meshcom_settings.node_call);
+    if(gwRegBlocked())
+        web_client.println("<div class=\"mbx-warn\">! node registration failed, please check support</div>");
     web_client.println("<div id=\"content_layer\">\n");
 
     // initial content
@@ -1315,6 +1873,9 @@ void deliver_scaffold(bool bget_password)
     else
     {
         sub_page_info();
+#if defined(ESP32)
+        web_client.println("<script type=\"text/javascript\">if(typeof auPageInit=='function')auPageInit();</script>"); // the row is filled from /austatus
+#endif
     }
 
     web_client.println("</div>\n</body>\n</html>");
@@ -1331,24 +1892,6 @@ void sub_page_unknown()
     web_client.println("<div id=\"content_inner\">");
     web_client.println("<p>The page you have requested is not known.</p>");
     web_client.println("</div>");
-    web_client.println(); // The HTTP response ends with another blank line
-}
-
-/**
- * ###########################################################################################################################
- * delivers a page to enter the nodes web password
- */
-void sub_page_login()
-{
-    _create_meshcom_subheader("Login required");
-    web_client.println("<div id=\"content_inner\">");
-    web_client.println("<div class=\"cardlayout\">");
-    web_client.println("<label class=\"cardlabel\">Enter Password</label>");
-    web_client.println("<div class=\"grid\">");
-    web_client.println("<span>In order to continue, you need to log in.</span>");
-    web_client.println("<input type=\"password\" maxlength=\"20\" size=\"20\" id=\"nodepassword\" name=\"nodepassword\">");
-    web_client.println("<button onclick=\"login(document.getElementById('nodepassword').value)\" style=\"justify-self:self-end;\">Login</button");
-    web_client.println("</div></div></div>");
     web_client.println(); // The HTTP response ends with another blank line
 }
 
@@ -1412,18 +1955,58 @@ static String urlEncode(const char *input)
  */
 static String getEffectiveNtpServer()
 {
-    if (strlen(meshcom_settings.node_ownntp) >= 7)
-        return String(meshcom_settings.node_ownntp);
-
+    // nRF52 STATIC-IP node: the path uses the configured node_ownip and the legacy rule for the
+    // stored mode 0 (44er -> Hamnet); gwEffectiveMode keeps this status equal to that path.
+    bool staticLegacy = false;
+    const char *webNtpIpText = meshcom_settings.node_ip;
+#if defined(NRF52_SERIES)
+    if (ethIsStaticConfigured())
+    {
+        staticLegacy = true;
+        webNtpIpText = meshcom_settings.node_ownip;
+    }
+#endif
     IPAddress webNtpIp;
-    webNtpIp.fromString(meshcom_settings.node_ip);
+    webNtpIp.fromString(webNtpIpText);
+    uint8_t ownIp[4] = {webNtpIp[0], webNtpIp[1], webNtpIp[2], webNtpIp[3]};
+    const uint8_t netMode = gwEffectiveMode((uint8_t)meshcom_settings.node_hamnet_only, ownIp, staticLegacy);
 
-    bool bHamnet = (webNtpIp[0] == 44 || meshcom_settings.node_hamnet_only == 1);
+    // nRF52 has no DNS resolver: an own NTP host name is ignored there (gwResolve sets ownntp_ignored)
+#if defined(NRF52_SERIES)
+    const bool hasResolver = false;
+#else
+    const bool hasResolver = true;
+#endif
 
-    if (bHamnet)
-        return (webNtpIp[1] == 143) ? "44.143.0.9 (default)" : "44.148.224.123 (default)";
+    GwTarget t;
+    if (!gwResolveNode(meshcom_settings.node_gwsrv, netMode, ownIp,
+                       meshcom_settings.node_ownntp, hasResolver, &t))
+        return String("n/a");
+
+    // own NTP in effect (IPv4 literal, or host name where a resolver exists)
+    if (strlen(meshcom_settings.node_ownntp) >= 7 && !t.ownntp_ignored)
+    {
+        if (t.ntp_host != NULL)
+            return String(t.ntp_host);
+        char obuf[20];
+        snprintf(obuf, sizeof(obuf), "%u.%u.%u.%u", t.ntp_ip[0], t.ntp_ip[1], t.ntp_ip[2], t.ntp_ip[3]);
+        return String(obuf);
+    }
+
+    String def;
+    if (t.ntp_host != NULL)
+    {
+        def = String(t.ntp_host) + " (default)";
+    }
     else
-        return "pool.ntp.org (default)";
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%u.%u.%u.%u (default)", t.ntp_ip[0], t.ntp_ip[1], t.ntp_ip[2], t.ntp_ip[3]);
+        def = String(buf);
+    }
+    if (t.ownntp_ignored)
+        def += " (own NTP ignored)";
+    return def;
 }
 
 /**
@@ -1444,7 +2027,14 @@ void sub_page_rxlog()
     // since boot -- data-win covers that for the JS side.
     uint8_t mcqPrio[6] = {0};
     txRingPrioCounts(mcqPrio);
+    uint8_t mcqWait[6] = {0};
+    txRingAckWaitCounts(mcqWait);
     uint32_t mcqDedupWin = setlogDedupWindowMin(stat_last_window.newid, PRIO_STAT_INTERVAL_S, MAX_DEDUP_RING);
+    uint32_t mcqDrop = 0;
+    for (int i = 0; i < 5; i++)
+    {
+        mcqDrop += stat_last_window.drop[i];
+    }
     uint32_t mcqAgeS = 0;
     if (stat_last_window_ms != 0)
     {
@@ -1465,8 +2055,10 @@ void sub_page_rxlog()
     web_client.printf(" data-win=\"%d\" data-rx=\"%lu\" data-tx=\"%lu\" data-int=\"%d\" data-newid=\"%lu\"\n",
                        (stat_last_window_ms != 0) ? 1 : 0, (unsigned long)stat_last_window.rx_ms, (unsigned long)stat_last_window.tx_ms,
                        (int)PRIO_STAT_INTERVAL_S, (unsigned long)stat_last_window.newid);
-    web_client.printf(" data-dup=\"%lu\" data-dedup=\"%u\" data-dwin=\"%lu\" data-age=\"%lu\"></div>\n",
-                       (unsigned long)stat_last_window.dup, (unsigned int)MAX_DEDUP_RING, (unsigned long)mcqDedupWin, (unsigned long)mcqAgeS);
+    web_client.printf(" data-dup=\"%lu\" data-dedup=\"%u\" data-dwin=\"%lu\" data-age=\"%lu\" data-drop=\"%lu\"\n",
+                       (unsigned long)stat_last_window.dup, (unsigned int)MAX_DEDUP_RING, (unsigned long)mcqDedupWin, (unsigned long)mcqAgeS, (unsigned long)mcqDrop);
+    web_client.printf(" data-w0=\"%u\" data-w1=\"%u\" data-w2=\"%u\" data-w3=\"%u\" data-w4=\"%u\" data-w5=\"%u\"></div>\n",
+                       (unsigned int)mcqWait[0], (unsigned int)mcqWait[1], (unsigned int)mcqWait[2], (unsigned int)mcqWait[3], (unsigned int)mcqWait[4], (unsigned int)mcqWait[5]);
     web_client.println("</div>");
 
     web_client.println("<div style=\"overflow:scroll;\">");
@@ -1576,6 +2168,22 @@ void sub_page_position()
     web_client.println(); // The HTTP response ends with another blank line
 }
 
+// Firmware-Stand als "v4.40a", "-" wenn unbekannt. Auf der Luft stehen nur
+// die Stellen hinter "4." (msg_source_fw_version, 40 = 4.40) und der
+// Buchstabe (msg_source_fw_sub_version). ver/sub kommen aus DERSELBEN
+// Momentaufnahme wie das Rufzeichen der Zeile (NbrRowView/NbrMhView): ein
+// zweites nbrRowGet() koennte auf nRF52 (OnRxDone im LORA-Task) schon eine
+// neu vergebene Zeile lesen. Eigene Zeile: shortVERSION()/shortSUBVERSION().
+static void webPrintFw(uint8_t ver, char sub)
+{
+    if (ver == 0)
+        web_client.print("-");
+    else if (sub >= 'a' && sub <= 'z')
+        web_client.printf("v4.%02u%c", (unsigned)ver, sub);
+    else
+        web_client.printf("v4.%02u", (unsigned)ver);
+}
+
 /**
  * ###########################################################################################################################
  * delivers the mheard-page to be injected into the scaffold
@@ -1612,7 +2220,8 @@ void sub_page_mheard()
                      "It hears: stations it hears, as far as my table knows. "
                      "Only it hears: of those, how many no other direct neighbour of mine hears -- its value as a relay for me. "
                      "Relay role: Super node = by far the most exclusive stations; Needed = at least one exclusive station; Redundant = everything it hears is heard by others too. "
-                     "It reports: the neighbour count the station announces itself (NCNT).</p>");
+                     "It reports: the neighbour count the station announces itself (NCNT). "
+                     "Firmware: the version the station puts into its own frames, '-' until one arrives.</p>");
 
     uint8_t *idx = (uint8_t *)malloc((size_t)NBR_MAX_ROWS);
     if (idx == NULL)
@@ -1628,6 +2237,7 @@ void sub_page_mheard()
 
     for (int k = 0; k < shown; k++)
     {
+        meshcom_wdt_feed(); // one feed per card; shown <= NBR_MAX_ROWS keeps the loop bounded
         NbrMhView v;
         if (!nbrMhGet(nbrMatrix, idx[k], now_min, &v))
             continue;
@@ -1661,6 +2271,9 @@ void sub_page_mheard()
             web_client.printf("<div><span class=\"font-bold\">Last frame:</span><br><span>%s</span></div>", ptype);
         }
         web_client.printf("<div><span class=\"font-bold\">Hardware:</span><br><span>%s</span></div>", nbrHardwareName(v.hw));
+        web_client.print("<div><span class=\"font-bold\">Firmware:</span><br><span>");
+        webPrintFw(v.fw_ver, v.fw_sub);
+        web_client.print("</span></div>");
         web_client.printf("<div><span class=\"font-bold\">Country / mode:</span><br><span title=\"high nibble: country index, low nibble: LoRa modulation\">%01X / %01X</span></div>", (v.mod >> 4), (v.mod & 0x0f));
         if (v.rssi == NBR_MH_RSSI_UNKNOWN)
             web_client.printf("<div><span class=\"font-bold\">RSSI:</span><br><span></span></div>");
@@ -1854,6 +2467,7 @@ void sub_page_path()
         rec[nrec].idx = (uint16_t)i;
         nrec++;
     }
+    meshcom_wdt_feed(); // once after collecting routes; loop bounded by route_total and maxrec
 
     // Einfuegesortieren nach Hops, dann Alter (beide aufsteigend) -- rec[0]
     // (eigene Zeile, Hops 0) bleibt dabei an erster Stelle.
@@ -1868,16 +2482,18 @@ void sub_page_path()
         }
         rec[b + 1] = key;
     }
+    meshcom_wdt_feed(); // once after the sort; nrec <= maxrec
 
     // Tabelle DIREKT unter #content_inner, keine Wrapper-div: das Tabellen-
     // CSS des Scaffolds greift nur auf "#content_inner > table" (siehe
     // sub_page_neighbours() unten, Bench 2026-09-20).
     web_client.println("<table class=\"table\">");
     web_client.println("<thead><tr class=\"font-bold\"><td>Call</td><td>Hops</td><td>GW</td><td>Mesh</td>"
-                        "<td>Hears me</td><td>Via / Covered by</td><td>Reach</td><td>Age (min)</td></tr></thead>");
+                        "<td>Firmware</td><td>Hears me</td><td>Via / Covered by</td><td>Reach</td><td>Age (min)</td></tr></thead>");
 
     for (size_t k = 0; k < nrec; k++)
     {
+        meshcom_wdt_feed(); // one feed per record; nrec <= maxrec keeps the loop bounded
         PathRec &pr = rec[k];
 
         if (pr.kind == 0)
@@ -1889,6 +2505,9 @@ void sub_page_path()
                 web_client.print("<td>-</td>");
             else
                 web_client.printf("<td>%s</td>", (r0.flags & NBR_FLAG_MESH) ? "Y" : "N");
+            web_client.print("<td>");
+            webPrintFw(shortVERSION(), shortSUBVERSION());
+            web_client.print("</td>");
             web_client.print("<td>-</td>"); // Hears me: keine Kante nach mir selbst
             web_client.print("<td>-</td>"); // Via / Covered by: nicht anwendbar auf die eigene Zeile
 
@@ -1921,6 +2540,9 @@ void sub_page_path()
                 web_client.print("<td>-</td>");
             else
                 web_client.printf("<td>%s</td>", (v.flags & NBR_FLAG_MESH) ? "Y" : "N");
+            web_client.print("<td>");
+            webPrintFw(v.fw_ver, v.fw_sub);
+            web_client.print("</td>");
 
             NbrEdgeView hm;
             if (nbrEdgeGet(nbrMatrix, 0, X, &hm) && hm.snr != NBR_SNR_UNKNOWN && nbrFresh(hm.last_min, now_min))
@@ -1970,7 +2592,8 @@ void sub_page_path()
 
         bool hasRow = (r.row != 0xFF);
         NbrRowView rv;
-        uint8_t rowFlags = hasRow && nbrRowGet(nbrMatrix, r.row, &rv) ? rv.flags : 0;
+        bool rowOk = hasRow && nbrRowGet(nbrMatrix, r.row, &rv);
+        uint8_t rowFlags = rowOk ? rv.flags : 0;
 
         web_client.printf("<tr><td><a href=\"https://aprs.fi/?call=%s\" target=\"_blank\">%s</a></td>", urlEncode(r.call).c_str(), htmlEscape(String(r.call)).c_str());
         web_client.printf("<td>%u</td>", (unsigned)r.hops);
@@ -1980,6 +2603,13 @@ void sub_page_path()
             web_client.print("<td>-</td>"); // Horizont hat keine Zeile, oder keine Positions-Info
         else
             web_client.printf("<td>%s</td>", (rowFlags & NBR_FLAG_MESH) ? "Y" : "N");
+
+        web_client.print("<td>");
+        if (rowOk)
+            webPrintFw(rv.fw_ver, rv.fw_sub);
+        else
+            web_client.print("-"); // Horizont (keine Zeile) oder Zeile zwischendurch verschwunden
+        web_client.print("</td>");
 
         if (hasRow)
         {
@@ -2053,6 +2683,7 @@ void sub_page_path()
     // Telefon nicht, deshalb stehen dieselben Erklaerungen hier als Text.
     web_client.print("<p style=\"font-size:var(--fs-s);color:#555;\">"
                       "Hops: 0 = me, 1 = direct neighbour, 2+ = reached via other nodes."
+                      " | Firmware: the version the station puts into its own frames, '-' until one arrives or beyond 2 hops."
                       " | Hears me: SNR at which that neighbour last reported hearing me, '-' if unknown or not a direct/2-hop row."
                       " | Via: the entry path this station was heard on (2-hop: the direct neighbour it is via; horizon: the entry row, and beyond it if cheap to show)."
                       " Covered by (direct neighbours only): other direct neighbours that also hear this one -- 'only me' means I am its only link."
@@ -2201,6 +2832,7 @@ void sub_page_neighbours()
     // wird hier nicht nachgebaut) je sichtbarer Zeile.
     for (uint8_t i = 0; i < n; i++)
     {
+        meshcom_wdt_feed(); // one feed per row; n <= NBR_MAX_ROWS keeps the loop bounded
         uint8_t X = idx[i];
         // -1 ("NA") ist moeglich, wenn der LORA-Task (nRF52) die Kante (X, 0)
         // zwischen nbrDirectMask() oben und diesem Aufruf freigibt -- als 0
@@ -2224,6 +2856,7 @@ void sub_page_neighbours()
     nCount[0] = (uint8_t)((nbrMaskCount(directMaskGlobal) > 255) ? 255 : nbrMaskCount(directMaskGlobal));
     for (uint8_t frm = 0; frm < NBR_MAX_ROWS; frm++)
     {
+        meshcom_wdt_feed(); // one feed per row; frm < NBR_MAX_ROWS keeps the loop bounded
         NbrMask hm = nbrHearersMask(nbrMatrix, frm, now_min);
         for (int y = nbrMaskNext(hm, -1); y >= 0; y = nbrMaskNext(hm, y))
         {
@@ -2315,6 +2948,7 @@ void sub_page_neighbours()
     web_client.print("<td title=\"Super: largest exclusive share. Needed: has exclusive nodes. Redundant: everything it hears is heard by others.\">Role</td>");
     for (uint8_t j = colStart; j < colEnd; j++)
     {
+        meshcom_wdt_feed(); // one feed per header column; colEnd - colStart <= 64 keeps the loop bounded
         web_client.printf("<td>%u<br><span style=\"writing-mode:vertical-rl;transform:rotate(180deg);white-space:nowrap;\">", (unsigned)(j + 1));
         nbrPrintCall(idx[j]);
         web_client.print("</span></td>");
@@ -2323,6 +2957,7 @@ void sub_page_neighbours()
 
     for (uint8_t i = 0; i < n; i++)
     {
+        meshcom_wdt_feed(); // one feed per row; n <= NBR_MAX_ROWS keeps the loop bounded
         uint8_t X = idx[i];
         bool rowESelf = false;
         for (uint8_t e = 0; e < neself_shown; e++)
@@ -2803,6 +3438,7 @@ void sub_page_mailbox()
     web_client.printf("<div><span>blocked by caps</span><b>%u</b></div>", (unsigned)cnt->blocked_bp);
     web_client.printf("<div><span>notices sent</span><b>%u</b></div>", (unsigned)cnt->notified);
     web_client.printf("<div><span>notices blocked</span><b>%u</b></div>", (unsigned)cnt->notice_blocked);
+    web_client.printf("<div><span>refused, already acked</span><b>%u</b></div>", (unsigned)cnt->dropped_acked);   // SNF-ACK-01
     web_client.println("</div>");
     web_client.println("<p class=\"font-small\" style=\"margin:7px;\">Same numbers as the <code>MBOX</code> setlog line. Dropped by cap and dropped no slot are two counters on purpose: the first means the 20-per-hour ceiling ate a hold time, the second means the mailbox was full.</p>");
     web_client.println("</div>");
@@ -2811,6 +3447,22 @@ void sub_page_mailbox()
     web_client.println(); // The HTTP response ends with another blank line
 }
 #endif // ENABLE_MSGSTORE
+
+// LED-08: charge LED text for the info page: the stored console value, plus the RM override while one
+// is active ("auto (RM on)"), as in --info.
+static const char *webChargeLedText()
+{
+#if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
+    const char *stored = bCHARGE_LED ? "auto" : "off";
+    if (!chargeLedOverrideActive())
+        return stored;
+    static char txt[24];
+    snprintf(txt, sizeof(txt), "%s (RM %s)", stored, chargeLedModeName(chargeLedEffective()));
+    return txt;
+#else
+    return "off";
+#endif
+}
 
 /**
  * ###########################################################################################################################
@@ -2889,6 +3541,15 @@ void sub_page_setup()
     _create_setup_switch_element("volt", "Voltage", "show batt. voltage, not percent", bDisplayVolt);           // create Switch-Element inclucing Label and Description
     _create_setup_switch_element("mesh", "Mesh", "enable mesh/forwarding of received LoRa messages", bMESH);    // create Switch-Element inclucing Label and Description
     _create_setup_switch_element("via", "Via", "enable via", bVIA);    // create Switch-Element inclucing Label and Description
+    { // LED-08: only on a node that has the LED (the info page says "not fitted" otherwise); same console rows as --board led / --charge led
+        const LedFitted ledHw = ledFittedNow();
+#if defined(BOARD_LED) || (defined(LED_PIN) && defined(LED_PIXEL) && LED_PIXEL > 0)   // same guard as the webSetup_setParam handler and the --board led console row
+        if (ledHw.board)
+            _create_setup_switch_element("boardled", "Board LED", "short heartbeat flash every 2 s", bUSER_BOARD_LED);
+#endif
+        if (ledHw.charge)
+            _create_setup_switch_element("chargeled", "Charge LED", "on = follows charging, off = dark", bCHARGE_LED);
+    }
 
 // We support OTA only for ESP based devices, not RAK
 #ifdef ESP32
@@ -2900,6 +3561,51 @@ void sub_page_setup()
 #endif
 
     web_client.println("</div></div>");
+
+#if defined(ESP32)
+    // AU-09 (#1187): firmware auto update, ONE dropdown off / prod / dev. It applies on change through
+    // setparam aumode (web_setup.cpp runs --updchan + --autoupdate, read-back is the stored state).
+    // The old params autoupdate / updchan stay valid for the Web API but have no select any more.
+    {
+        const int au_mode = meshcom_settings.node_autoupd;                 // 1 notify (default), 2 auto (console only, blocked)
+        const int au_chan = meshcom_settings.node_updchan ? 1 : 0;         // 0 prod, 1 dev
+        const bool au_sb_ok = fwNetSafebootCapable();                      // AU-12: Safeboot new enough for staged updates
+        web_client.println("<div class=\"cardlayout collapsablecard\">");
+        web_client.println("<label class=\"cardlabel\">Firmware Update</label>");
+        web_client.println("<span>Open this for the firmware update settings.</span>\n");
+        web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
+        web_client.println("<div class=\"grid grid2\">");
+        web_client.println("<label for=\"aumode\">Auto update</label>");
+        web_client.printf("<select id=\"aumode\" name=\"aumode\"%s onchange=\"setvalue('aumode',this.value,true);\">\r\n", au_sb_ok ? "" : " disabled");
+        // D3: notify (prod), notify (dev), auto greyed. A console-set auto shows greyed and selected.
+        web_client.printf("\t<option value=\"prod\" %s>notify (prod, icssw-org releases)</option>\n", (au_mode != 2 && au_chan == 0) ? "selected" : "");
+#if defined(MC_AU_DEV_CHANNEL)   // dev channel: fork builds only (fw_update.h)
+        web_client.printf("\t<option value=\"dev\" %s>notify (dev, DK5EN releases)</option>\n", (au_mode != 2 && au_chan == 1) ? "selected" : "");
+#endif
+        web_client.printf("\t<option value=\"auto\" disabled %s>auto (coming soon)</option>\n", (au_mode == 2) ? "selected" : "");
+        web_client.println("</select>");
+        web_client.println("<p class=\"font-small\" style=\"grid-column:1/-1\">auto: coming soon -- for now the node notifies only. Install new firmware from the Info page.</p>");
+        if (!au_sb_ok && !fwNetBootloaderQio())
+        {
+            // AU-16: a DIO bootloader cannot start the Safeboot; the web flasher renews both
+            web_client.println("<p class=\"font-small\" style=\"grid-column:1/-1\">Auto update is locked: the bootloader (DIO) cannot start the Safeboot. Flash this node once with the web flasher to renew bootloader and Safeboot; OTA and auto update never replace them.</p>");
+        }
+        else if (!au_sb_ok)
+        {
+            // AU-12: update is locked until Safeboot is new enough; OTA and auto update never replace Safeboot
+            const int au_sb_ver = fwNetSafebootVersion();
+            char au_sb_found[16];
+            if (au_sb_ver >= 1)
+                snprintf(au_sb_found, sizeof(au_sb_found), "v%d", au_sb_ver);
+            else
+                snprintf(au_sb_found, sizeof(au_sb_found), "%s", au_sb_ver == 0 ? "none (old)" : "unreadable");
+            web_client.printf("<p class=\"font-small\" style=\"grid-column:1/-1\">Auto update needs a newer Safeboot (found: %s, required: v%d). Flash this node once with the web flasher to install it; OTA and auto update never replace Safeboot.</p>\n",
+                au_sb_found, AU_SAFEBOOT_MIN);
+        }
+        web_client.println("</div>");
+        web_client.println("</div>");
+    }
+#endif
 
     // NMTU-01 / #1190: MTU card, collapsible like every other card (UI-04 / D5), all boards. Applies on change through
     // setparam mtu (--mtu, read-back node_ethmtu); the MSS shown is MTU - 40. A stored value outside the
@@ -2924,6 +3630,26 @@ void sub_page_setup()
         web_client.println("</div>");
         web_client.println("</div>");
     }
+
+    // Remote Admin card: password and remote management of this node (moved from the Remote page). Filled by raSt().
+    // RA-HTML-BEGIN
+    web_client.println("<div class=\"cardlayout collapsablecard\">");
+    web_client.println("<label class=\"cardlabel\">Remote Admin</label>");
+    web_client.println("<span>Open this for the password and remote management.</span>\n");
+    web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
+    web_client.println("<div class=\"grid grid3\">");
+    web_client.println("<label for=\"ra_on\">Remote management</label><span></span>"
+                       "<input type=\"checkbox\" role=\"switch\" id=\"ra_on\" disabled onchange=\"raOn()\">"
+                       "<span id=\"ra_hint\" class=\"font-small\" style=\"grid-column:1/-1\"></span>"
+                       "<style>#ra_hint:empty,#ra_msg:empty{display:none}</style>");
+    web_client.println("<label for=\"ra_pw\">Password :</label>"
+                       "<input type=\"password\" id=\"ra_pw\" maxlength=\"14\" size=\"10\" autocomplete=\"new-password\" placeholder=\"New password\">"
+                       "<button id=\"ra_set\" onclick=\"raSet()\">Set</button>");
+    web_client.println("<span id=\"ra_st\" class=\"font-small\" style=\"grid-column:1/3\"></span><button id=\"ra_clr\" onclick=\"raClr()\">Clear</button>"
+                       "<p id=\"ra_msg\" class=\"font-small\" style=\"grid-column:1/-1\"></p>"
+                       "<p class=\"font-small\" style=\"grid-column:1/-1\">This password also protects the net console (port 2323) and the KISS port, not only remote management.</p>");
+    web_client.println("</div></div>");
+    // RA-HTML-END
 
     // IP Network Settings Section
     web_client.println("<div class=\"cardlayout collapsablecard\">");
@@ -2960,7 +3686,8 @@ void sub_page_setup()
     _create_setup_switch_element("kissauth", "KISS Auth", "require HMAC auth on port 8001 (uses --passwd)", bKISSAUTH);
     #endif
     _create_setup_switch_element("gateway", "Gateway", "enable gateway", bGATEWAY);   // create Switch-Element inclucing Label and Description
-
+    // BF-01: remote-management brute-force protection (--rmstrictsecurity). Console and web only, never over RM.
+    _create_setup_switch_element("rmstrict", "RM strict security", "brute-force protection: lockout and rate limits for remote management", meshcom_settings.node_rmstrict == 1);
     web_client.println("</div></div>");
 
     // Position Settings Section
@@ -3006,6 +3733,10 @@ void sub_page_setup()
 
     #ifdef OneWire_GPIO
     _create_setup_textinput_element("owgpio", "1-Wire GPIO", String(meshcom_settings.node_owgpio), "36", "onewiregpio", 3, false, false); // create Textinput-Element including Label and Button
+    #endif
+    #if defined(ENABLE_WIND)
+    _create_setup_textinput_element("windpin", "Anemometer GPIO", String(meshcom_settings.node_wind_pin), "0", "windpin", 2, false, false);
+    _create_setup_textinput_element("windcal", "Anemometer km/h per Hz", String(meshcom_settings.node_wind_cal, 2), "2.4", "windcal", 6, false, false);
     #endif
 
     web_client.println("</div><div class=\"grid grid2\">");
@@ -3064,6 +3795,12 @@ void sub_page_setup()
     #endif
     #if defined(ENABLE_AHT20)
     _create_setup_switch_element("aht20", "AHT20", "enable AHT20 sensor", bAHT20ON);                       // create Switch-Element inclucing Label and Description
+    #endif
+    #if defined(ENABLE_LTR390)
+    _create_setup_switch_element("uv", "UV (LTR390)", "enable LTR390 UV sensor", bUVON);
+    #endif
+    #if defined(ENABLE_WIND)
+    _create_setup_switch_element("wind", "Anemometer", "enable anemometer (reed contact)", bWINDON);
     #endif
     #if defined(ENABLE_SHT21)
     _create_setup_switch_element("sht21", "SHT21", "enable SHT21 sensor", bSHT21ON);                       // create Switch-Element inclucing Label and Description
@@ -3139,6 +3876,23 @@ void sub_page_setup()
     web_client.println("</div>"); // cardbody
     web_client.println("</div>");
 #endif
+
+    // BLK-01: blocked callsigns card (not tied to the store node).
+    web_client.println("<div class=\"cardlayout collapsablecard\">");
+    web_client.println("<label class=\"cardlabel\">Blocked callsigns</label>");
+    web_client.println("<span>Open this to drop frames from unwanted stations.</span>\n");
+    web_client.println("<button class=\"cardtoggle\" onclick=\"togglecard(this);\"><i></i></button>\n");
+    web_client.println("<div class=\"cardbody\">");
+    web_client.println("<div class=\"grid grid3\">");
+    {
+        char blkcsv[BLOCKLIST_CSV_MAX];
+        blockListGet(blkcsv, sizeof(blkcsv));
+        _create_setup_textinput_element("blockcall", "Callsign list (up to 16)", String(blkcsv), "DL1ABC,DL2XYZ-12", "blockcall", BLOCKLIST_CSV_MAX + BLOCKLIST_MAX, false, false);
+    }
+    web_client.println("</div>");
+    web_client.println("<div class=\"mbx-warn\">Frames from, or relayed by, a listed call are dropped: not shown, not uploaded, not relayed. A call without SSID blocks all its SSIDs. An empty field clears the list.</div>");
+    web_client.println("</div>"); // cardbody
+    web_client.println("</div>");
 
     // Config Backup / Restore Section (CS-03)
     // The download is a plain navigation to /config.json -- the response
@@ -3227,8 +3981,8 @@ void sub_content_messages()
                     if (bDEBUG)
                         Serial.printf("aprsmsg.msg_source_call:%s, aprsmsg.msg_gateway_call:%s, aprsmsg.msg_destination_call:%s, aprsmsg.msg_payload:%s\n", aprsmsg.msg_source_call, aprsmsg.msg_source_last, aprsmsg.msg_destination_call, aprsmsg.msg_payload);
 
-                    if (msgtxt.indexOf('{') > 0)
-                        msgtxt = String(aprsmsg.msg_payload).substring(0, msgtxt.indexOf('{'));
+                    // strip only the trailing "{NNN" ACK marker; a '{' inside the text stays (msg_body.h)
+                    msgtxt = msgtxt.substring(0, msg_body_visible_len(msgtxt.c_str(), msgtxt.length()));
 
                     // WEB-03a: mesh-derived strings (payload, path, callsigns) are attacker-controlled -- escape before HTML output
                     String msgtxt_esc = htmlEscape(msgtxt);
@@ -3333,33 +4087,37 @@ void sub_page_spectrum()
     web_client.println("<div id=\"content_inner\">");
 #if defined(SX1262X) || defined(SX126X) || defined(SX1262_V3) || defined(SX1262_E290) || defined(USING_SX1262)
 
-    meshcom_settings.node_specstart = 432.0;
-    meshcom_settings.node_specend = 434.0;
-    meshcom_settings.node_specstep = 0.025;
-    meshcom_settings.node_specsamples = 2048;
+    // Local values only: the page used to overwrite (and persist) the node_spec* settings, which
+    // broke the production-locked 432/434/0.025/2048.
+    float spec_start = 432.0;
+    float spec_end = 434.0;
+    float spec_step = 0.025;
+    int spec_samples = 2048;
 
     if(getFreq() > 860)
     {
-        meshcom_settings.node_specstart = 863.0;
-        meshcom_settings.node_specend = 870.0;
-        meshcom_settings.node_specstep = 0.100;
-        meshcom_settings.node_specsamples = 2048;
+        spec_start = 863.0;
+        spec_end = 870.0;
+        spec_step = 0.100;
+        spec_samples = 2048;
     }
 
-    float spec_curr_freq = meshcom_settings.node_specstart; // scan start frequency
+    float spec_curr_freq = spec_start; // scan start frequency
 
     uint16_t step_pixel_width = 10;  // the amout of pixel we use for a single frequency step
     uint16_t step_pixel_height = 10; // the amout of pixel we use for a single frequency step
 
-    uint16_t num_fsteps = roundf((meshcom_settings.node_specend - spec_curr_freq) / meshcom_settings.node_specstep);
+    uint16_t num_fsteps = roundf((spec_end - spec_curr_freq) / spec_step);
+    #if not defined(BOARD_T_DECK_PRO)
     uint16_t current_fStep = 0;                                       // current iteration  counter
+    #endif
     uint16_t start_x = 60;                                            // x-position where the diagramm starts
     uint16_t start_y = 10;                                            // y-position where the diagramm starts
     uint16_t end_x = start_x + ((num_fsteps + 1) * step_pixel_width); // calculate the end. Use one more fstep as the last frequency step also starts a scan and giving a result
     uint16_t end_y = start_y + (RADIOLIB_SX126X_SPECTRAL_SCAN_RES_SIZE * step_pixel_height);
 
-    uint16_t own_freq_marker_width = round(((meshcom_settings.node_bw / 1000) / meshcom_settings.node_specstep) * step_pixel_width);
-    uint16_t own_freq_marker_center = start_x + (((meshcom_settings.node_freq - spec_curr_freq) / meshcom_settings.node_specstep) * step_pixel_width);
+    uint16_t own_freq_marker_width = round(((meshcom_settings.node_bw / 1000) / spec_step) * step_pixel_width);
+    uint16_t own_freq_marker_center = start_x + (((meshcom_settings.node_freq - spec_curr_freq) / spec_step) * step_pixel_width);
     uint16_t own_freq_marker_start = own_freq_marker_center - (own_freq_marker_width / 2);
 
 
@@ -3395,14 +4153,14 @@ void sub_page_spectrum()
         }
 
         #if not defined(BOARD_T_DECK_PRO)
-        while (spec_curr_freq < meshcom_settings.node_specend)
+        while (spec_curr_freq < spec_end)
         {                                                                                                 // loop through the frequency range
-            uint16_t *res = sx126x_spectral_scan_freq(spec_curr_freq, meshcom_settings.node_specsamples); // get spectrum analysis for this given frequency
+            uint16_t *res = sx126x_spectral_scan_freq(spec_curr_freq, spec_samples); // get spectrum analysis for this given frequency
             for (uint8_t i = 0; i < RADIOLIB_SX126X_SPECTRAL_SCAN_RES_SIZE; i++)
             { // loop through the power bins (usually 33)
                 if (res[i] > 0)
                 {                                                               // did the scan found anything above zero?
-                    float alpha = (res[i] / meshcom_settings.node_specsamples); // calculate the alpha-value (transperancy) ranging 0.0 - 1.0
+                    float alpha = (res[i] / spec_samples); // calculate the alpha-value (transperancy) ranging 0.0 - 1.0
                     if (alpha < 0.2)
                         alpha = 0.2; // use a minimum of alpha. Smaller values might be hard to see
                     web_client.printf("<rect width=\"%d\" height=\"%d\" x=\"%d\" y=\"%d\" fill=\"rgba(0,0,0,%0.3f)\"/>", step_pixel_width, step_pixel_height, start_x + (current_fStep * step_pixel_width), start_y + (i * step_pixel_height), alpha);
@@ -3418,7 +4176,7 @@ void sub_page_spectrum()
             delay(50); // lets wait for a moment (the example code used 100ms but 50ms seems to work, too)
             yield();   // this loop runs for a long time, pet the watchdog and give other tasks a chance to operate
             current_fStep++;
-            spec_curr_freq += meshcom_settings.node_specstep;
+            spec_curr_freq += spec_step;
         }
         #endif
 
@@ -3429,8 +4187,8 @@ void sub_page_spectrum()
         #endif
     }
 
-    web_client.printf("<p>The Node scans the frequency range (%.3fMHz - %.3fMHz) in small steps using a given scan bandwith (%.3fMHz).</p>\n", meshcom_settings.node_specstart, meshcom_settings.node_specend, meshcom_settings.node_specstep);
-    web_client.printf("<p>It performs %i measurements each step and puts them into %i power-bins. That is why you will see several measurement-dots for each step. The darker the dot, the more measurements have been put into that certain power bin.</p>", meshcom_settings.node_specsamples, RADIOLIB_SX126X_SPECTRAL_SCAN_RES_SIZE);
+    web_client.printf("<p>The Node scans the frequency range (%.3fMHz - %.3fMHz) in small steps using a given scan bandwith (%.3fMHz).</p>\n", spec_start, spec_end, spec_step);
+    web_client.printf("<p>It performs %i measurements each step and puts them into %i power-bins. That is why you will see several measurement-dots for each step. The darker the dot, the more measurements have been put into that certain power bin.</p>", spec_samples, RADIOLIB_SX126X_SPECTRAL_SCAN_RES_SIZE);
 #else
     web_client.println("<p>Spectrum scan is not supported on this device.</p>");
 #endif
@@ -3445,6 +4203,7 @@ void sub_page_info()
 {
     _create_meshcom_subheader("Node Information");
     web_client.println("<div id=\"content_inner\">");
+
 
     web_client.println("<table class=\"table mw-600\">");
     web_client.println("<thead><tr class=\"font-bold\"><td>Item</td><td>Value</td></tr></thead>");
@@ -3461,15 +4220,28 @@ void sub_page_info()
     // BAT-01: global_batt==0.0 is the established "no reading" convention (grounded pin, or
     // the ADC-path no-battery detection in batt_functions.cpp) -- same check the on-device
     // displays already use, see loop_functions.cpp.
-    if (global_batt == 0.0) {
-        web_client.print("<tr><td>Battery</td><td>USB (no battery)</td></tr>\n");
-    } else {
-        web_client.printf("<tr><td>Battery</td><td>%.3fV (%d%%) max %.3fV", global_batt / 1000.0, global_proz, meshcom_settings.node_maxv);
-        #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
-            web_client.printf("<br>Charge Indicator LED: %s", bCHARGE_LED ? "auto (follows charging)" : "off");
-        #endif
+    {   // BAT-04: charge state appended inside the same cell; BCS_UNKNOWN leaves the HTML unchanged
+        const BattChargeInfo bci = global_batt_charge;
+        char bcsText[40];
+        bcsText[0] = '\0';
+        if (bci.state != BCS_UNKNOWN) battChargeFormat(bcsText, sizeof(bcsText), bci);
+        if (global_batt == 0.0) {
+            web_client.print("<tr><td>Battery</td><td>USB (no battery)");
+        } else {
+            web_client.printf("<tr><td>Battery</td><td>%.3fV (%d%%) max %.3fV", global_batt / 1000.0, global_proz, meshcom_settings.node_maxv);
+        }
+        if (bcsText[0]) web_client.printf(", %s", bcsText);
         web_client.print("</td></tr>\n");
     }
+#if defined(ESP32)
+    { // AU web GUI: the fixed lines come from here, the message and the action button are filled by the page JS from GET /austatus
+        const char *auChan = meshcom_settings.node_updchan ? "dev" : "prod";
+        web_client.printf("<tr id=\"au_tr\"><td>Auto update</td><td id=\"au_row\" data-blepause=\"%d\">mode %s, channel %s<br>env %s, running %s",
+            AU_BLE_PAUSE, meshcom_settings.node_autoupd == 2 ? "auto (notify only)" : "notify", auChan,
+            MC_ENV_NAME[0] ? MC_ENV_NAME : "(unknown)", MC_BUILD_TAG[0] ? MC_BUILD_TAG : "local");
+        web_client.print("<div id=\"au_msg\"></div><div id=\"au_err\"></div><div id=\"au_hint\"></div><button type=\"button\" id=\"au_btn\" disabled>Check now</button></td></tr>\n");
+    }
+#endif
     // WEB-SW: grouped switch overview, one <tr> per group, labels matching
     // sub_page_setup()'s _create_setup_switch_element() calls verbatim, same
     // #if guards as there. test/golden/info_switch_lint.py checks every
@@ -3477,8 +4249,20 @@ void sub_page_info()
     web_client.printf("<tr><td>Settings</td><td>");
     web_client.printf("Gateway: %s<br>", (bGATEWAY ? "on" : "off"));
     web_client.printf("Mesh: %s<br>", (bMESH ? "on" : "off"));
+    { // RM-07 (#1189): label equals the setup switch label (info_switch_lint); counters as in --info, no passwd, no tag
+        const RmStats &rm = g_rmStats;
+        unsigned long rmRej = (unsigned long)rm.rej_format + rm.rej_tag + rm.rej_replay + rm.rej_blocked +
+                              rm.rej_rate + rm.rej_lockout + rm.rej_disabled;
+        web_client.printf("Remote management (RM1): %s (ok=%lu rej=%lu)<br>", (meshcom_settings.node_rm == 1 ? "on" : "off"), (unsigned long)rm.ok, rmRej);
+        web_client.printf("RM strict security: %s<br>", (meshcom_settings.node_rmstrict == 1 ? "on" : "off")); // BF-01
+    }
     web_client.printf("Via: %s<br>", (bVIA ? "on" : "off"));
     web_client.printf("Userbutton: %s<br>", (bButtonCheck ? "on" : "off"));
+    { // LED-08: outside the battery branch (USB-powered nodes too); labels equal the setup switch labels (info_switch_lint)
+        const LedFitted ledHw = ledFittedNow();
+        web_client.printf("Board LED: %s<br>", !ledHw.board ? "not fitted" : !bUSER_BOARD_LED ? "off" : boardLedPinUsable() ? "on" : "on (pin busy)");   // as --info
+        web_client.printf("Charge LED: %s<br>", ledHw.charge ? webChargeLedText() : "not fitted");
+    }
     #if defined(ANALOG_PIN)
     if (!bAnalogCheck)
         web_client.printf("Analog: off<br>");
@@ -3498,7 +4282,7 @@ void sub_page_info()
     { // GW-LINK: MeshCom server path (Internet/Hamnet) and whether it still answers
         char gwl[96];
         gwLinkFormat(gwl, sizeof(gwl), bGATEWAY, meshcom_settings.node_hasIPaddress, millis());
-        web_client.printf("Server: %s<br>", htmlEscape(String(gwl)).c_str());
+        web_client.printf("Gateway: %s<br>", htmlEscape(String(gwl)).c_str());
     }
     #if defined(HAS_ETHERNET)
     web_client.printf("Ethernet Mode: %s<br>", (meshcom_settings.node_netmode == 1 ? "on" : "off"));
@@ -3538,6 +4322,34 @@ void sub_page_info()
     #endif
     #if defined(ENABLE_AHT20)
     web_client.printf("AHT20: %s<br>", (bAHT20ON ? "on" : "off"));
+    #endif
+    #if defined(ENABLE_LTR390)
+    {
+        float fuv = 0.0f;
+        if(bUVON)
+        {
+            if(wxMeanGet(&wx_uv_mean, &fuv))
+                web_client.printf("UV (LTR390): on (%s), UVI %.1f, mean %.1f (n=%lu)<br>", (ltr390_found ? "found" : "error"), wx_uv_last, fuv, (unsigned long)wxMeanCount(&wx_uv_mean));
+            else
+                web_client.printf("UV (LTR390): on (%s), UVI %.1f, mean - (n=0)<br>", (ltr390_found ? "found" : "error"), wx_uv_last);
+        }
+        else
+            web_client.printf("UV (LTR390): off<br>");
+    }
+    #endif
+    #if defined(ENABLE_WIND)
+    {
+        float fwm = 0.0f, fwg = 0.0f;
+        if(bWINDON)
+        {
+            char swm[12] = "-", swg[12] = "-";
+            if(wxMeanGet(&wx_wind_mean, &fwm)) snprintf(swm, sizeof(swm), "%.1f", fwm);
+            if(wxGustGet(&wx_wind_gust, &fwg)) snprintf(swg, sizeof(swg), "%.1f", fwg);
+            web_client.printf("Anemometer: on (pin %i), %.1f km/h, mean %s, gust %s<br>", meshcom_settings.node_wind_pin, wx_wind_last_kmh, swm, swg);
+        }
+        else
+            web_client.printf("Anemometer: off<br>");
+    }
     #endif
     #if defined(ENABLE_SHT21)
     web_client.printf("SHT21: %s<br>", (bSHT21ON ? "on" : "off"));
@@ -3665,6 +4477,14 @@ void sub_page_info()
         }
     #endif
 
+    { // BLK-01
+        char blkcsv[BLOCKLIST_CSV_MAX];
+        blockListGet(blkcsv, sizeof(blkcsv));
+        String blkshow = blkcsv[0] ? String(blkcsv) : String("none");
+        blkshow.replace(",", ", ");
+        web_client.printf("<tr><td>Blocked calls</td><td>%s (dropped %lu)</td></tr>\n", htmlEscape(blkshow).c_str(), (unsigned long)blockListDrops());
+    }
+
     // web_client.printf("<tr><td></td><td></td></tr>\n", );
     // web_client.printf("<tr><td></td><td></td></tr>\n", );
     // web_client.printf("<tr><td></td><td></td></tr>\n", );
@@ -3779,7 +4599,7 @@ void sub_page_mcp23017()
  * Sends a valid HTTP header. Takes care of the status code.
  * We may need to set more status_text cases once we need them.
  */
-void send_http_header(uint16_t http_status_code, uint8_t content_type)
+void send_http_header(uint16_t http_status_code, uint8_t content_type, const char *extra_header)
 {
     String status_text = "";
     switch (http_status_code)
@@ -3793,9 +4613,15 @@ void send_http_header(uint16_t http_status_code, uint8_t content_type)
     case 401:
         status_text = "Unauthorized";
         break; // use this when ever a request was successful
+    case 403:
+        status_text = "Forbidden";
+        break; // RM GUI W1c: web guard (rebinding Host / cross-site request)
     case 404:
         status_text = "Not Found";
         break; // use this if a request was not known
+    case 405:
+        status_text = "Method Not Allowed";
+        break; // W2-1: GET /rmsend (the password must travel in a POST body)
     case 422:
         status_text = "Unprocessable Entity";
         break; // use this if a parameter was not processable (e.g. out of bounds or somehow wrong)
@@ -3809,9 +4635,14 @@ void send_http_header(uint16_t http_status_code, uint8_t content_type)
         web_client.println("Content-type:application/json");
     else
         web_client.println("Content-type:text/html; charset=utf-8");
-    web_client.println("Access-Control-Allow-Origin: *"); // tell modern browsers that CORS is okay for us
-    web_client.println("Access-Control-Allow-Methods: GET, POST, OPTIONS");
-    web_client.println("Access-Control-Allow-Headers: access-control-allow-headers,access-control-allow-methods,access-control-allow-origin, Origin, Content-Type, Accept");
+    if (web_cors_ok) // RM GUI W1c: no CORS on state-changing paths, /config and /rmstatus
+    {
+        web_client.println("Access-Control-Allow-Origin: *"); // tell modern browsers that CORS is okay for us
+        web_client.println("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+        web_client.println("Access-Control-Allow-Headers: access-control-allow-headers,access-control-allow-methods,access-control-allow-origin, Origin, Content-Type, Accept");
+    }
+    if (extra_header && extra_header[0])
+        web_client.println(extra_header); // WEB-AUTH-01: Set-Cookie of the login / logout answers
     web_client.println("Connection: close");                                  // tell broser that the connection will be closed (in opposite to keep-alive)
     web_client.println("Cache-Control: no-cache, no-store, must-revalidate"); // set caching policy
     web_client.println("Pragma: no-cache");                                   // Disable caching or request/respinse
@@ -3982,6 +4813,70 @@ void send_message(String web_header)
     web_client.println(); // The HTTP response ends with another blank line
 }
 
+#if defined(ESP32)
+/**
+ * ###########################################################################################################################
+ * GET /austatus -- state of the firmware update for the Info page row (spec 5.1). Read-only.
+ */
+static void sub_au_status()
+{
+    FwNetStatus au;
+    fwNetGetStatus(au);
+    AuUiIn in;
+    memset(&in, 0, sizeof(in));
+    const char *stn = "idle";
+    if (au.state == FWS_BUSY)
+        stn = "busy";
+    else if (au.state == FWS_DONE_OK)
+        stn = "ok";
+    else if (au.state == FWS_DONE_FAIL)
+        stn = "fail";
+    const char *jobn = "none";
+    if (au.job == FWJ_CHECK)
+        jobn = "check";
+    else if (au.job == FWJ_DOWNLOAD)
+        jobn = "download";
+    else if (au.job == FWJ_STAGELAN)
+        jobn = "stagelan";
+    snprintf(in.st, sizeof(in.st), "%s", stn);
+    snprintf(in.job, sizeof(in.job), "%s", jobn);
+    snprintf(in.run, sizeof(in.run), "%.23s", MC_BUILD_TAG[0] ? MC_BUILD_TAG : "local");
+    snprintf(in.avail, sizeof(in.avail), "%.23s", au.availTag);
+    snprintf(in.staged, sizeof(in.staged), "%.23s", au.staged ? au.stagedTag : "");
+    snprintf(in.err, sizeof(in.err), "%.23s", au.state == FWS_BUSY ? "" : au.lastErr);
+    snprintf(in.mode, sizeof(in.mode), "%s", meshcom_settings.node_autoupd == 2 ? "auto" : "notify"); // never "off" (D1)
+    snprintf(in.chan, sizeof(in.chan), "%s", meshcom_settings.node_updchan ? "dev" : "prod");
+    in.newer = (au.availNewer && au.availTag[0]) ? 1 : 0;
+    in.inst = au.installable ? 1 : 0;
+    // pct: compressed bytes written / the length the running job stages (progLen), only while a download runs
+    const bool dl = au.state == FWS_BUSY && (au.job == FWJ_DOWNLOAD || au.job == FWJ_STAGELAN);
+    if (dl)
+        in.pct = fwProgressPct(au.bytesDone, au.progLen);
+    in.phone = fwNetPhoneHeld() ? 1 : 0; // same expression as the lowheap_phone token
+    in.guard = auBleGuardActive() ? 1 : 0; // BLE guard (campaign-au-webgui-ux section 7)
+    in.sbok = fwNetSafebootCapable() ? 1 : 0;
+    snprintf(in.sbwhy, sizeof(in.sbwhy), "%s", fwNetSafebootWhy()); // ok|old|dio, tells the page why the install is blocked
+    in.etaS = auEtaS(au.stagedIlen);
+    fwNetHeapNow(&in.ifree, &in.iblk);
+
+    char body[640];
+    size_t n = auStatusJson(in, body, sizeof(body));
+    // "up": seconds since boot, appended outside auStatusJson. The page compares it across the install restart
+    // when the build tag cannot be compared (an image built without MC_BUILD_TAG reports run "local").
+    n = fwJsonAppendUp(body, sizeof(body), n, (uint32_t)(esp_timer_get_time() / 1000000));
+    // "img": first 8 hex of the running image's ELF SHA-256. With run "local" the page counts the install as done
+    // only when it changed: a Safeboot fallback restarts the node too (uptime drops) but keeps the old image.
+    const esp_app_desc_t *d = MC_RUNNING_APP_DESC();
+    if (d != NULL)
+        n = fwJsonAppendImg(body, sizeof(body), n, d->app_elf_sha256, sizeof(d->app_elf_sha256));
+    send_http_header(n ? 200 : 500, RESPONSE_TYPE_JSON);
+    if (n)
+        web_client.println(body);
+    else
+        web_client.println("{\"ok\":false}");
+}
+#endif
+
 /**
  * ###########################################################################################################################
  * Tries to execute a Web-API function call.
@@ -3989,6 +4884,7 @@ void send_message(String web_header)
  */
 void call_function(String web_header)
 {
+    const String full_header = web_header; // the X-MC check below needs the header lines
     web_header = web_header.substring(web_header.indexOf("/callfunction/?") + 15, web_header.indexOf("HTTP/1.1"));
     web_header.trim();
     funCallStruct functionData;
@@ -4002,6 +4898,18 @@ void call_function(String web_header)
     {
         functionData.functionName = decodeURLPercentCoding(web_header);
         functionData.functionParameter = "";
+    }
+
+    // AU web GUI: the update actions need the page's own `X-MC: 1` request header (people yes, foreign web pages no).
+    // Checked on the full header, before anything runs; independent of MC_WEB_GUARD.
+    if (!webGuardCallAllowed(functionData.functionName.c_str(), full_header.c_str(), full_header.length()))
+    {
+        if (bDEBUG)
+            Serial.println("[WEB];guard;upd_no_xmc");
+        web_cors_ok = false;
+        send_http_header(403, RESPONSE_TYPE_JSON);
+        web_client.println("{\"ok\":false,\"err\":\"forbidden\"}");
+        return;
     }
 
 #if defined(ENABLE_MSGSTORE)
@@ -4050,11 +4958,26 @@ void call_function(String web_header)
  */
 void setparam(String web_header)
 {
+    const String full_header = web_header; // the X-MC check below needs the header lines
 
     web_header = web_header.substring(web_header.indexOf("/setparam/?") + 11, web_header.indexOf(" HTTP/1.1"));
     String param_name = decodeURLPercentCoding(web_header.substring(0, web_header.indexOf("=")));
     String param_value = decodeURLPercentCoding(web_header.substring(web_header.indexOf("=") + 1));
     param_name.toLowerCase();
+
+    // AU web GUI: no setparam name may run an update command for a foreign page (every value lands in a
+    // "--<cmd> %s" line that commandAction() splits on "--"), and aumode/autoupdate/updchan change the update
+    // mode or channel: the upd* gate of call_function() would be a bypass otherwise. Same X-MC proof,
+    // independent of MC_WEB_GUARD.
+    if (!webGuardSetparamAllowed(param_name.c_str(), param_value.c_str(), full_header.c_str(), full_header.length()))
+    {
+        if (bDEBUG)
+            Serial.println("[WEB];guard;setparam_upd_no_xmc");
+        web_cors_ok = false;
+        send_http_header(403, RESPONSE_TYPE_JSON);
+        web_client.println("{\"ok\":false,\"err\":\"forbidden\"}");
+        return;
+    }
 
     setupStruct setupData;
     setupData.paramName = param_name;

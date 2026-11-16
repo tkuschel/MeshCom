@@ -34,6 +34,7 @@ using namespace ace_button;
 #include <TouchDrvGT911.hpp>
 #include <lvgl.h>
 #include "lv_obj_functions.h"
+#include "tdeck_theme.h"
 #include "lv_obj_functions_extern.h"
 #include "tdeck_debug.h"
 #include "kbd_repeat.h"
@@ -136,6 +137,11 @@ void initTDeck()
     setCpuFrequencyMhz(160);
 
     Serial.println("[INIT]...initTDeck");
+
+    // TD-23: settings are loaded; the first wake (first boot message ->
+    // tft_on()) restores pre_sleep_brightness_level, so set it to the saved
+    // level of the active day/night period before anything wakes the panel.
+    brightnessApplySaved();
 
     // Issue 962 deepsleep (esp32_sleep.cpp): --deepsleep holds TDECK_POWERON
     // and TDECK_TFT_BACKLIGHT low with gpio_hold_en()/gpio_deep_sleep_hold_en()
@@ -499,7 +505,8 @@ void setupLvgl()
     disp_drv.full_refresh = 0;
     disp_drv.monitor_cb = tdeck_dbg_monitor_cb;
     disp_drv.render_start_cb = tdeck_dbg_render_start_cb;
-    lv_disp_drv_register( &disp_drv );
+    lv_disp_t *theme_disp = lv_disp_drv_register( &disp_drv );
+    tdeck_theme_init(theme_disp); // TD-THEME-01: before any widget exists
 
     /*Initialize the  input device driver*/
 

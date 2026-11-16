@@ -10,6 +10,7 @@ This file contains all web-based setup functions
 #if defined(ENABLE_MSGSTORE)
 #include <msgstore_api.h> // stage 3 store node: store/storecall/storetime/storeslots/storenotice setparam mapping
 #endif
+#include <blocked_calls.h> // BLK-01
 #include <string>
 
 
@@ -79,7 +80,11 @@ void webSetup_setParam(setupStruct *setupData){
     if(setupData->paramName.equals("setvia")) {        
         snprintf(message_text, sizeof(message_text), "--via %s", setupData->paramValue.c_str());                   // set command string
         commandAction(message_text, bPhoneReady);                                                                      // try to execute the command
-        setupData->returnCode = strcmp(meshcom_settings.node_via, setupData->paramValue.c_str())==0?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;    //check if new parameter was accepted, return with corresponding code
+        // --via legt die Liste getrimmt, in Grossbuchstaben und "NONE" als leer
+        // ab. Gegen dieselbe Form vergleichen -- sonst meldet die GUI bei
+        // "dk8vw-99" oder "none" FAIL, obwohl der Wert uebernommen wurde.
+        String sWanted = viaCanonical(setupData->paramValue);
+        setupData->returnCode = strcmp(meshcom_settings.node_via, sWanted.c_str())==0?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;    //check if new parameter was accepted, return with corresponding code
         setupData->returnValue = meshcom_settings.node_via;                                                           // send back the current used value
         return;
     } else
@@ -227,6 +232,26 @@ void webSetup_setParam(setupStruct *setupData){
         return;
     } else
 
+    #if defined(BOARD_LED) || (defined(LED_PIN) && defined(LED_PIXEL) && LED_PIXEL > 0)
+    if(setupData->paramName.equals("boardled")) {   // LED-08: same toggle row as the console
+        snprintf(message_text, sizeof(message_text), "--board led %s", setupData->paramValue.equals("on") ? "on" : "off");
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = (bUSER_BOARD_LED == setupData->paramValue.equals("on"))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = bUSER_BOARD_LED?"on":"off";
+        return;
+    } else
+    #endif
+
+    #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
+    if(setupData->paramName.equals("chargeled")) {  // LED-08: on = auto (follows charging), off = dark
+        snprintf(message_text, sizeof(message_text), "--charge led %s", setupData->paramValue.equals("on") ? "on" : "off");
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = (bCHARGE_LED == setupData->paramValue.equals("on"))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = bCHARGE_LED?"on":"off";
+        return;
+    } else
+    #endif
+
     if(setupData->paramName.equals("via")) {
         snprintf(message_text, sizeof(message_text), "--via %s", setupData->paramValue.c_str());
         commandAction(message_text, bPhoneReady);
@@ -242,6 +267,72 @@ void webSetup_setParam(setupStruct *setupData){
         setupData->returnValue = bMESH?"on":"off";
         return;
     } else
+
+    // RM-07 (#1189): RM1 remote management, routed through "--remotemgmt on|off"; read-back is node_rm
+    if(setupData->paramName.equals("rm")) {
+        snprintf(message_text, sizeof(message_text), "--remotemgmt %s", setupData->paramValue.c_str());
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = ((meshcom_settings.node_rm == 1) == (setupData->paramValue.compareTo("on")==0))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = (meshcom_settings.node_rm == 1)?"on":"off";
+        return;
+    } else
+
+    // BF-01: RM strict security (brute-force protection), routed through "--rmstrictsecurity on|off";
+    // read-back is node_rmstrict. Console and web only, never over RM.
+    if(setupData->paramName.equals("rmstrict")) {
+        snprintf(message_text, sizeof(message_text), "--rmstrictsecurity %s", setupData->paramValue.c_str());
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = ((meshcom_settings.node_rmstrict == 1) == (setupData->paramValue.compareTo("on")==0))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = (meshcom_settings.node_rmstrict == 1)?"on":"off";
+        return;
+    } else
+
+#if defined(ESP32)
+    // AU web GUI (D1-D3): the web select offers notify (prod), notify (dev) and a greyed "auto (coming soon)".
+    // aumode prod|dev sets "--autoupdate notify" and "--updchan <ch>"; "off" and "auto" are refused here (auto
+    // is console-only and blocked in this build, off no longer exists). Read-back: "auto" while the console
+    // set auto (the select shows it greyed and selected), else the stored channel.
+    // "autoupdate" and "updchan" below stay for Web API compatibility; autoupdate refuses auto and off.
+    if(setupData->paramName.equals("aumode")) {
+        const bool auProd = setupData->paramValue.equalsIgnoreCase("prod");
+        const bool auDev = setupData->paramValue.equalsIgnoreCase("dev");
+        if(auProd || auDev) {
+            snprintf(message_text, sizeof(message_text), "--autoupdate notify");
+            commandAction(message_text, bPhoneReady);
+            if(meshcom_settings.node_autoupd == 1) {
+                snprintf(message_text, sizeof(message_text), "--updchan %s", auDev ? "dev" : "prod");
+                commandAction(message_text, bPhoneReady);
+            }
+        }
+        const char *cur = (meshcom_settings.node_autoupd == 2) ? "auto" : (meshcom_settings.node_updchan ? "dev" : "prod");
+        setupData->returnCode = ((auProd || auDev) && meshcom_settings.node_autoupd == 1 && setupData->paramValue.equalsIgnoreCase(cur))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = cur;
+        return;
+    } else
+
+    if(setupData->paramName.equals("autoupdate")) {
+        // only "notify" is accepted from the web: auto is console-only (blocked build), off was removed
+        if(setupData->paramValue.equalsIgnoreCase("notify")) {
+            snprintf(message_text, sizeof(message_text), "--autoupdate notify");
+            commandAction(message_text, bPhoneReady);
+        }
+        const char *cur = (meshcom_settings.node_autoupd == 2) ? "auto" : "notify";
+        setupData->returnCode = setupData->paramValue.equalsIgnoreCase(cur)?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        if(setupData->paramValue.equalsIgnoreCase("auto"))
+            setupData->returnCode = WS_RETURNCODE_FAIL;
+        setupData->returnValue = cur;
+        return;
+    } else
+
+    if(setupData->paramName.equals("updchan")) {
+        snprintf(message_text, sizeof(message_text), "--updchan %s", setupData->paramValue.c_str());
+        commandAction(message_text, bPhoneReady);
+        const char *cur = meshcom_settings.node_updchan ? "dev" : "prod";
+        setupData->returnCode = setupData->paramValue.equalsIgnoreCase(cur)?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = cur;
+        return;
+    } else
+#endif
 
     if(setupData->paramName.equals("gateway")) {
         snprintf(message_text, sizeof(message_text), "--gateway %s", setupData->paramValue.c_str());
@@ -419,6 +510,55 @@ void webSetup_setParam(setupStruct *setupData){
     } else
     #endif
 
+    #if defined(ENABLE_LTR390)
+    if(setupData->paramName.equals("uv")) {
+        snprintf(message_text, sizeof(message_text), "--uv %s", setupData->paramValue.c_str());
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = (bUVON == (setupData->paramValue.compareTo("on")==0))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = bUVON?"on":"off";
+        return;
+    } else
+    #endif
+
+    #if defined(ENABLE_WIND)
+    if(setupData->paramName.equals("wind")) {
+        snprintf(message_text, sizeof(message_text), "--wind %s", setupData->paramValue.c_str());
+        commandAction(message_text, bPhoneReady);
+        setupData->returnCode = (bWINDON == (setupData->paramValue.compareTo("on")==0))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = bWINDON?"on":"off";
+        return;
+    } else
+
+    if(setupData->paramName.equals("windpin")) {
+        int pin = 0;
+        char tail = 0;
+        // exactly one integer, nothing after it: "abc" must not read as pin 0 and report OK
+        bool bOneInt = (sscanf(setupData->paramValue.c_str(), "%d %c", &pin, &tail) == 1);
+        if(bOneInt) {
+            snprintf(message_text, sizeof(message_text), "--windpin %d", pin);
+            commandAction(message_text, bPhoneReady);
+        }
+        setupData->returnCode = (bOneInt && meshcom_settings.node_wind_pin == pin)?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = String(meshcom_settings.node_wind_pin);
+        return;
+    } else
+
+    if(setupData->paramName.equals("windcal")) {
+        float cal = 0.0f;
+        char value[16];
+        snprintf(value, sizeof(value), "%s", setupData->paramValue.c_str());
+        cmdDecimalComma(value);   // "2,5" -> "2.5", same as the temperature offsets
+        bool bOneFloat = (sscanf(value, "%f", &cal) == 1);
+        if(bOneFloat) {
+            snprintf(message_text, sizeof(message_text), "--windcal %s", value);
+            commandAction(message_text, bPhoneReady);
+        }
+        setupData->returnCode = (bOneFloat && fabsf(meshcom_settings.node_wind_cal - cal) < 0.005f)?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = String(meshcom_settings.node_wind_cal, 2);
+        return;
+    } else
+    #endif
+
     #if defined(ENABLE_AHT20)
     if(setupData->paramName.equals("aht20")) {
         snprintf(message_text, sizeof(message_text), "--aht20 %s", setupData->paramValue.c_str());
@@ -464,6 +604,32 @@ void webSetup_setParam(setupStruct *setupData){
         commandAction(message_text, bPhoneReady);
         setupData->returnCode = (bNoMSGtoALL == (setupData->paramValue.compareTo("on")==0))?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
         setupData->returnValue = bNoMSGtoALL?"on":"off";
+        return;
+    } else
+
+    if(setupData->paramName.equals("blockcall")) {
+        // BLK-01: validate first; an invalid request never reaches the console command.
+        String req = setupData->paramValue;
+        req.trim();
+        if(req.length() == 0)
+            req = "none";
+
+        char want[BLOCKLIST_CSV_MAX];
+        char bad[BLOCKLIST_CSV_MAX];
+        char have[BLOCKLIST_CSV_MAX];
+        if(!blockListParse(req.c_str(), want, sizeof(want), bad, sizeof(bad)))
+        {
+            blockListGet(have, sizeof(have));
+            setupData->returnCode = WS_RETURNCODE_FAIL;
+            setupData->returnValue = have;
+            return;
+        }
+        // the canonical list always fits the line; the raw request (spaces) may not
+        snprintf(message_text, sizeof(message_text), "--blockcall %s", want[0] ? want : "none");
+        commandAction(message_text, bPhoneReady);
+        blockListGet(have, sizeof(have));
+        setupData->returnCode = (strcmp(have, want)==0 && blockListLastSaveOk())?WS_RETURNCODE_OKAY:WS_RETURNCODE_FAIL;
+        setupData->returnValue = have;
         return;
     } else
 
@@ -847,12 +1013,12 @@ void webSetup_getParam(setupStruct *setupData){
         return;
     } else
 
-    if(setupData->paramName.equals("ethmtu")) {
+    if(setupData->paramName.equals("mtu")) {         // #1190
         setupData->returnValue = String(meshcom_settings.node_ethmtu);
         return;
     } else
 
-    if(setupData->paramName.equals("mtu")) {         // #1190
+    if(setupData->paramName.equals("ethmtu")) {
         setupData->returnValue = String(meshcom_settings.node_ethmtu);
         return;
     } else
@@ -894,6 +1060,20 @@ void webSetup_getParam(setupStruct *setupData){
         return;
     } else
 
+    #if defined(BOARD_LED) || (defined(LED_PIN) && defined(LED_PIXEL) && LED_PIXEL > 0)
+    if(setupData->paramName.equals("boardled")) {
+        setupData->returnValue = bUSER_BOARD_LED?"on":"off";
+        return;
+    } else
+    #endif
+
+    #if defined(XPOWERS_CHIP_AXP192) || defined(XPOWERS_CHIP_AXP2101)
+    if(setupData->paramName.equals("chargeled")) {
+        setupData->returnValue = bCHARGE_LED?"on":"off";
+        return;
+    } else
+    #endif
+
     if(setupData->paramName.equals("via")) {
         setupData->returnValue = bVIA?"on":"off";
         return;
@@ -903,6 +1083,33 @@ void webSetup_getParam(setupStruct *setupData){
         setupData->returnValue = bMESH?"on":"off";
         return;
     } else
+
+    if(setupData->paramName.equals("rm")) {
+        setupData->returnValue = (meshcom_settings.node_rm == 1)?"on":"off";
+        return;
+    } else
+
+    if(setupData->paramName.equals("rmstrict")) {
+        setupData->returnValue = (meshcom_settings.node_rmstrict == 1)?"on":"off";
+        return;
+    } else
+
+#if defined(ESP32)
+    if(setupData->paramName.equals("aumode")) {       // AU-09 (#1187)
+        setupData->returnValue = (meshcom_settings.node_autoupd == 2) ? "auto" : (meshcom_settings.node_updchan ? "dev" : "prod");
+        return;
+    } else
+
+    if(setupData->paramName.equals("autoupdate")) {   // AU-09 (#1187)
+        setupData->returnValue = (meshcom_settings.node_autoupd == 2) ? "auto" : "notify"; // never "off" (D1)
+        return;
+    } else
+
+    if(setupData->paramName.equals("updchan")) {      // AU-09 (#1187)
+        setupData->returnValue = meshcom_settings.node_updchan ? "dev" : "prod";
+        return;
+    } else
+#endif
 
     if(setupData->paramName.equals("gateway")) {
         setupData->returnValue = bGATEWAY?"on":"off";
@@ -1009,6 +1216,30 @@ void webSetup_getParam(setupStruct *setupData){
         return;
     } else
 
+    #if defined(ENABLE_LTR390)
+    if(setupData->paramName.equals("uv")) {
+        setupData->returnValue = bUVON?"on":"off";
+        return;
+    } else
+    #endif
+
+    #if defined(ENABLE_WIND)
+    if(setupData->paramName.equals("wind")) {
+        setupData->returnValue = bWINDON?"on":"off";
+        return;
+    } else
+
+    if(setupData->paramName.equals("windpin")) {
+        setupData->returnValue = String(meshcom_settings.node_wind_pin);
+        return;
+    } else
+
+    if(setupData->paramName.equals("windcal")) {
+        setupData->returnValue = String(meshcom_settings.node_wind_cal, 2);
+        return;
+    } else
+    #endif
+
     if(setupData->paramName.equals("sht21")) {        
         setupData->returnValue = bSHT21ON?"on":"off";
         return;
@@ -1028,6 +1259,13 @@ void webSetup_getParam(setupStruct *setupData){
 
     if(setupData->paramName.equals("nomsgall")) {
         setupData->returnValue = bNoMSGtoALL?"on":"off";
+        return;
+    } else
+
+    if(setupData->paramName.equals("blockcall")) {
+        char have[BLOCKLIST_CSV_MAX];
+        blockListGet(have, sizeof(have));
+        setupData->returnValue = have;
         return;
     } else
 

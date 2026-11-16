@@ -11,7 +11,6 @@ definitions for HELTEC_V3
 #define MODUL_HARDWARE HELTEC_V3
 #define SX1262_V3
 #define RX_TIMEOUT_VALUE 0      // continous rx with 0
-#define ENABLE_INA226_DISABLED  // I2C fault
 
 //#define ENABLE_SOFTSER
 
@@ -86,6 +85,10 @@ definitions for HELTEC_V3
 // auch mit `--owgpio <pin>` nicht mehr einschalten -- das waere eine
 // Funktionsentfernung, keine Bereinigung.
 #define OneWire_GPIO -1
+
+// White user LED, GPIO35, active HIGH: `--board led` heartbeat (off by default) and RM "led on|off".
+// REMOTE_LED_PIN derives from BOARD_LED (loop_functions_extern.h).
+#define BOARD_LED 35
 
 #define GPS_RX_PIN 47
 #define GPS_TX_PIN 48

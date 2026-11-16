@@ -16,6 +16,7 @@
 #include "capture_functions.h"
 #include "dedup_functions.h"
 #include "ntp_async.h"      // NTP-01: isPending() haelt das GPS-Gate fuer --ntpsync offen
+#include "configuration_global.h"
 #include "instrument.h"     // TEMPORARY -- measurement scaffolding, see src/instrument.h
 #include "loop_breadcrumb.h" // F3: always-on LAST_LOOP_SECTION breadcrumb for TASK_WDT forensics
 #include "track_warning.h" // TRK-01: Warnhinweis bei aktivem Track
@@ -34,6 +35,11 @@ SPIClass ethSPI(FSPI);
 #include "esp32_pmu.h"
 #include "charge_led_mode.h"
 #include "esp32_flash.h"
+#include "fw_update.h"       // AU-05 (#1187): update policy (fwTick and friends)
+#include "wifi_start_gate.h" // D15: WiFi start rule for the auto update
+#include "fw_update_net.h"   // AU-05: CHECK / DOWNLOAD worker (own task)
+#include "rm_au_go.h"        // remote "upd go" state (rm_au_esp32.cpp)
+#include "safeboot/safeboot_ver.h" // AU-12: AU_SAFEBOOT_MIN for the boot demotion
 #include <esp_adc_cal.h>
 #include "esp_system.h"
 #include "esp_task_wdt.h"
@@ -54,6 +60,9 @@ Timeout timerSerial;
 #endif //ARDUINO_ARCH_ESP32
 
 // Kompatibilitaets-Macro: DIO1-Pin hat je nach Board verschiedene Namen
+#if defined(BOARD_T5_EPAPER)
+  #include <t5-epaper/utilities.h>   // T5-01: BOARD_LORA_IRQ is the SX1262 DIO1 (pin defines only)
+#endif
 #ifndef LORA_DIO1
   #if defined(E22_DIO1)
     #define LORA_DIO1 E22_DIO1
@@ -63,6 +72,8 @@ Timeout timerSerial;
     #define LORA_DIO1 RADIO_IRQ_PIN
   #elif defined(PIN_LORA_DIO_1)
     #define LORA_DIO1 PIN_LORA_DIO_1
+  #elif defined(BOARD_LORA_IRQ)
+    #define LORA_DIO1 BOARD_LORA_IRQ
   #else
     #warning "LORA_DIO1 not defined -- safety net digitalRead() disabled"
   #endif
@@ -123,6 +134,7 @@ Arduino_GFX *gfx = new Arduino_ST7796(
     #include "rtc_offset.h"    // RTC-1..3: UTC<->Knotenzeit, Refresh-Gate (test_rtc_offset)
 #endif
 #include "softser_functions.h"
+#include "telemetry_app.h"   // periodic T# source: own telemetry or soft-serial app
 
 // MeshCom Common (ers32/nrf52) Funktions
 #include <loop_functions.h>
@@ -142,6 +154,8 @@ Arduino_GFX *gfx = new Arduino_ST7796(
 #include <aprs_functions.h>
 #include <batt_functions.h>
 #include <lora_functions.h>
+#include "rm_runtime.h" // RM-05 (#1189): rmInit(), rmDrain()
+#include "blocked_calls.h" // BLK-01: blockListLoad()
 #include "txring_functions.h" // BP-02: txRingDepth() declaration
 #include <udp_functions.h>
 #include <extudp_functions.h>
@@ -151,6 +165,7 @@ Arduino_GFX *gfx = new Arduino_ST7796(
 #include <topo_ui.h>
 #include <time_functions.h>
 #include <clock.h>
+#include <onrx_stats.h> // OR-STAT
 #include <setlog_lines.h> // SL-04/SL-05: --setlog on line formatters (Welle 0)
 #include <onewire_functions.h>
 #include <onebutton_functions.h>
@@ -197,7 +212,6 @@ bool bDEEP_SLEEP = false;
     #ifndef BOARD_LED_ACTIVE_LOW
         #define BOARD_LED_ACTIVE_LOW 0
     #endif
-    bool bLED = BOARD_LED_ACTIVE_LOW;
 #endif
 
 #if defined(ENABLE_AUDIO)
@@ -207,6 +221,7 @@ bool bDEEP_SLEEP = false;
 #if defined(BOARD_T_DECK) || defined(BOARD_T_DECK_PLUS)
 #include <t-deck/tdeck_main.h>
 #include <t-deck/tdeck_extern.h>
+#include <t-deck/tdeck_helpers.h>   // TD-23: brightnessTick()
 #include <t-deck/lv_obj_functions.h>
 #include <t-deck/lv_obj_functions_extern.h>
 #endif
@@ -294,6 +309,9 @@ extern bool hb_warn_logged;
 
 // FreeRTOS Queue for BLE data from NimBLE task to Main Loop
 #include "freertos/queue.h"
+#include "freertos/semphr.h"   // AU-10: BLE pause guard
+#include "esp_heap_caps.h"
+#include "esp_timer.h"       // AU-20: esp_timer_dump for the bleguardcycle counters
 
 struct BleQueueItem {
     uint8_t data[MAX_MSG_LEN_PHONE];
@@ -459,18 +477,329 @@ class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 
 } chrCallbacks;
 
+// ---------------------------------------------------------------------------
+// BLE stack bring-up (esp32setup() and the AU-10 resume) and the AU-10 pause.
+//
+// AU-10 (#1187, AU-D18): on the classic ESP32 the TLS handshake of the firmware update does
+// not fit next to NimBLE. The update job task (src/esp32/fw_update_net.cpp) calls
+// esp32BlePause() before CHECK / DOWNLOAD and esp32BleResume() when it is done. The pause is
+// NimBLEDevice::deinit(true): deinit(false) would keep the NimBLEServer with its GATT objects,
+// but the host forgets the registered services on deinit (ble_hs_deinit) while the library
+// believes them started (m_gattsStarted, service defs built), so after a re-init the table
+// would be empty. deinit(true) deletes server, advertising and services; the resume rebuilds
+// them with bleStackStart(), the same function the boot uses.
+//
+// Concurrency: pServer / pService / pTxCharacteristic and every NimBLE call of the loop task are
+// used only under bleLifeLock() (non-blocking try-lock, false while a pause or resume is in
+// flight or BLE is down). The job task holds s_bleLife (blocking) across the deinit and the
+// init. The NimBLE host-task callbacks (onConnect, onDisconnect, onWrite) never take it.
+// ---------------------------------------------------------------------------
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
+static SemaphoreHandle_t s_bleLife = NULL;         // created in esp32setup(); NULL = no guarding (DISABLE_BLE)
+static volatile bool s_bleDown = false;            // BLE stack stopped by esp32BlePause() (or a failed resume)
+static volatile bool s_bleResumeFailed = false;    // the last esp32BleResume() failed; the loop retries
+static volatile bool s_bleGuard = false;           // BLE guard (spec 7): set/cleared by the loop task only; esp32BleResume() refuses while set
+static char s_bleManuf[60] = {0};                  // manufacturer data string, built once at boot
+
+// Loop-task side. True: the BLE objects may be used now, the caller MUST bleLifeUnlock().
+static inline bool bleLifeLock(void)
+{
+    if(s_bleLife == NULL)
+        return true;
+    if(xSemaphoreTake(s_bleLife, 0) != pdTRUE)
+        return false;
+    if(s_bleDown)
+    {
+        xSemaphoreGive(s_bleLife);
+        return false;
+    }
+    return true;
+}
+
+static inline void bleLifeUnlock(void)
+{
+    if(s_bleLife != NULL)
+        xSemaphoreGive(s_bleLife);
+}
+
+#if !defined(DISABLE_BLE)   // opt-out -D DISABLE_BLE: board without a usable BLE controller
+// Brings the whole NimBLE stack up: stack, security, server, service, both characteristics,
+// callbacks, advertising data. startAdv false = leave advertising off (BENCH_BLE_ADV_LATE boot).
+// False if NimBLEDevice::init() failed (the objects are then not created, the pointers stay NULL).
+static bool bleStackStart(bool startAdv)
+{
+    const std::string strBLEName = cBLEName;
+    const std::string strBLEManufData = s_bleManuf;
+
+    if(!NimBLEDevice::init(strBLEName))
+    {
+        printfdeb("[BLE ]...init failed\n");
+        return false;
+    }
+
+    printfdeb("[BLE ]...Device-Address <%s>\n", NimBLEDevice::toString().c_str());
+
+    //NimBLEDevice::setDeviceName(strBLEName);
+
+    NimBLEDevice::setPower(9); // +9dbm
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+    NimBLEDevice::setSecurityAuth(false, false, false);
+
+    /*if(meshcom_settings.bt_code >= 100000 && meshcom_settings.bt_code <= 999999)
+        NimBLEDevice::setSecurityPasskey(meshcom_settings.bt_code);
+    else
+        NimBLEDevice::setSecurityPasskey(PIN);*/
+
+    // Create the BLE Server. serverCallbacks is a static object: deleteCallbacks = false, or
+    // NimBLEDevice::deinit(true) (AU-10 pause) would delete it with the server.
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(&serverCallbacks, false);
+    pServer->advertiseOnDisconnect(true);
+
+    // Create the BLE Service
+    pService = pServer->createService(SERVICE_UUID);
+
+    // Create a BLE Characteristic
+    pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_TX,
+                        NIMBLE_PROPERTY::WRITE  |
+                        // Require a secure connection for read and write access
+                        //NIMBLE_PROPERTY::WRITE_AUTHEN |  // only allow writing if paired / encrypted
+                        //NIMBLE_PROPERTY::WRITE_ENC |  // only allow writing if paired / encrypted
+                        NIMBLE_PROPERTY::READ   |
+                        //NIMBLE_PROPERTY::READ_ENC |  // only allow reading if paired / encrypted
+                        //NIMBLE_PROPERTY::READ_AUTHEN |
+                        NIMBLE_PROPERTY::NOTIFY );
+
+    NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_RX,
+                        NIMBLE_PROPERTY::WRITE  |
+                        // Require a secure connection for read and write access
+                        //NIMBLE_PROPERTY::WRITE_AUTHEN |  // only allow writing if paired / encrypted
+                        //NIMBLE_PROPERTY::WRITE_ENC |  // only allow writing if paired / encrypted
+                        NIMBLE_PROPERTY::READ   |
+                        //NIMBLE_PROPERTY::READ_ENC |  // only allow reading if paired / encrypted
+                        //NIMBLE_PROPERTY::READ_AUTHEN |
+                        NIMBLE_PROPERTY::NOTIFY );
+
+    pRxCharacteristic->setCallbacks(&chrCallbacks);
+
+    // Start the service
+    pService->start();
+
+    // Start advertising
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->reset();
+
+    std::string advName = strBLEName;
+    if(!bBLElong && advName.size() > 26)
+      advName = advName.substr(0, 26); // keep first 26 chars for short adverts
+
+    pAdvertising->setName(advName);  // BLE Local Name (possibly shortened)
+
+    if (bBLElong)
+    {
+        pAdvertising->setManufacturerData(strBLEManufData);
+        pAdvertising->addServiceUUID(SERVICE_UUID);
+    }
+    else
+    {
+        // For short adverts we skip adding the 128-bit service UUID which
+
+    }
+
+    if (bBLElong)
+        pAdvertising->enableScanResponse(true);
+    else
+        pAdvertising->enableScanResponse(false);
+
+    if(startAdv)
+        pAdvertising->start();
+    else
+    {
+        // TM-11 experiment (BENCH_BLE_ADV_LATE): advertising starts in esp32loop() once
+        // [BOOT];ready fired (WiFi joined or given up) -- TD-01 hypothesis: BLE advertising
+        // during the first association attempt makes it fail.
+        printfdeb("[BLE ]...advertising deferred until the network phase settled (BENCH_BLE_ADV_LATE)\n");
+    }
+
+    printfdeb("[BLE ]...Waiting a client connection to notify...\n");
+    return true;
+}
+#endif   // !DISABLE_BLE
+
+bool esp32BlePause(void)
+{
+#if defined(DISABLE_BLE)
+    return false;
+#else
+    if(s_bleLife == NULL || s_bleDown || pServer == NULL)
+        return false;   // no guard, already down, or BLE never came up: nothing to pause
+    if(deviceConnected || isPhoneReady != 0)
+    {
+        Serial.print("[AU];ble;pause;skip;phone\n");
+        return false;
+    }
+
+    xSemaphoreTake(s_bleLife, portMAX_DELAY);
+
+    // Advertising off first: no new central can connect. Re-check afterwards, a phone may
+    // have connected between the check above and the stop.
+    NimBLEDevice::stopAdvertising();
+    if(deviceConnected || isPhoneReady != 0 || pServer->getConnectedCount() > 0)
+    {
+        NimBLEDevice::getAdvertising()->start();
+        xSemaphoreGive(s_bleLife);
+        Serial.print("[AU];ble;pause;skip;phone\n");
+        return false;
+    }
+
+    // From here the loop sees BLE as down (bleLifeLock() fails) and the pointers are NULL
+    s_bleDown = true;
+    pTxCharacteristic = nullptr;
+    pService = NULL;
+    pServer = NULL;
+
+    // clearAll = true: server, services, characteristics and the advertising object are
+    // deleted and rebuilt by esp32BleResume() (see the block comment above). The controller
+    // memory stays reserved for the resume (no esp_bt_controller_mem_release()).
+    const bool stopped = NimBLEDevice::deinit(true);
+    deviceConnected = false;
+    g_ble_conn_handle = 0xFFFF;
+    phoneRingsDetach();   // 5 KB back for the job; frames for the phone are dropped until the resume.
+                          // Inside s_bleLife, so a concurrent resume cannot bring BLE back without rings.
+    xSemaphoreGive(s_bleLife);
+
+    if(!stopped)
+        Serial.print("[AU];ble;pause;deinit;fail\n");   // the resume rebuilds the objects on the running stack
+    Serial.printf("[AU];ble;pause;heap;%u;blk;%u\n", (unsigned)esp_get_free_heap_size(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return true;
+#endif
+}
+
+// BLE guard force pause (spec 7): like esp32BlePause(), but a phone may be linked. Order: no re-advertising
+// after the disconnect, advertising off, deinit(true) with the link up (NimBLE terminates the link while
+// stopping), then the session flags are cleared by hand (the terminate may time out and skip onDisconnect).
+// Job task only. True if the stack was stopped; esp32BleResume() brings it back after the guard release.
+// Auto-update uses it on classic ESP32 only (AU_BLE_PAUSE): on the ESP32-S3 the forced deinit/reinit panics in the
+// NimBLE host task (bench). INSTRUMENT builds also compile it on other targets for the bleguardcycle bench (AU-20).
+#if AU_BLE_PAUSE
+bool esp32BleForcePause(void)
+{
+#if defined(DISABLE_BLE)
+    return false;
+#else
+    if(s_bleLife == NULL || s_bleDown || pServer == NULL)
+        return false;
+    const bool phone = deviceConnected || isPhoneReady != 0;
+
+    xSemaphoreTake(s_bleLife, portMAX_DELAY);
+    NimBLEServer *srv = pServer;
+    if(srv != NULL)
+        srv->advertiseOnDisconnect(false);
+    NimBLEDevice::stopAdvertising();
+
+    s_bleDown = true;
+    pTxCharacteristic = nullptr;
+    pService = NULL;
+    pServer = NULL;
+
+    const bool stopped = NimBLEDevice::deinit(true);
+    deviceConnected = false;
+    g_ble_conn_handle = 0xFFFF;
+    bleSessionResetAll();
+    phoneRingsDetach();   // same as esp32BlePause(), inside s_bleLife
+    xSemaphoreGive(s_bleLife);
+
+    if(!stopped)
+        Serial.print("[AU];ble;pause;deinit;fail\n");
+    Serial.printf("[AU];ble;pause;force;phone;%u;heap;%u;blk;%u\n", (unsigned)phone, (unsigned)esp_get_free_heap_size(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    return true;
+#endif
+}
+#endif   // AU_BLE_PAUSE
+
+// True while the BLE stack is stopped (paused by an update job or a failed resume).
+bool esp32BleDown(void)
+{
+    return s_bleDown;
+}
+
+bool esp32BleResume(void)
+{
+#if defined(DISABLE_BLE)
+    return true;
+#else
+    if(s_bleLife == NULL || !s_bleDown)
+        return true;   // never paused (or already back)
+    if(s_bleGuard)
+    {
+        Serial.print("[AU];ble;resume;refused;guard\n");   // only the guard release brings BLE back
+        return false;
+    }
+
+    xSemaphoreTake(s_bleLife, portMAX_DELAY);
+    if(!s_bleDown)
+    {
+        xSemaphoreGive(s_bleLife);
+        return true;   // a concurrent resume has won
+    }
+    // The phone rings come back before the stack, inside s_bleLife (two resumes must not both
+    // allocate). No memory: BLE stays off (the loop retries a few times; the next boot is the sure
+    // retry), logged once.
+    if(!phoneRingsAttach())
+    {
+        static bool s_ringsFailLogged = false;
+        if(!s_ringsFailLogged)
+        {
+            s_ringsFailLogged = true;
+            Serial.print("[AU];ble;resume;fail;rings\n");
+        }
+        s_bleResumeFailed = true;
+        xSemaphoreGive(s_bleLife);
+        return false;
+    }
+
+    const bool ok = bleStackStart(true);
+    if(ok)
+    {
+        s_bleDown = false;
+        s_bleResumeFailed = false;
+    }
+    else
+        s_bleResumeFailed = true;
+    xSemaphoreGive(s_bleLife);
+
+    Serial.print(ok ? "[AU];ble;resume;ok\n" : "[AU];ble;resume;fail\n");
+    return ok;
+#endif
+}
+
+
+
+// The Module* of the radio, kept for the read-only chip diagnostic (esp32_radio_diag.h).
+static Module *g_radio_mod = nullptr;
+#define MC_RADIO_MODULE(...) (g_radio_mod = new Module(__VA_ARGS__))
+#if defined(SX1262X) || defined(SX126X) || defined(SX1262_E22) || defined(SX1268_E22) || \
+    defined(SX1262_V3) || defined(USING_SX1262) || defined(SX1262_E290) || defined(SX1262_V4) || defined(BOARD_E220)
+#define MC_RADIO_SX126X_FAMILY 1
+#endif
 
 #ifdef SX127X
 // RadioModule SX1276 
-SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
+SX1276 radio = MC_RADIO_MODULE(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 // SyncWord - 1byte for SX127x, 2 bytes for SX126x
 // Check which chip is used !!!
 #endif
 
 #ifdef BOARD_E220
 // RadioModule derived from SX1262 
-LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
+LLCC68 radio = MC_RADIO_MODULE(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 #endif
 
 #ifdef SX1262X
@@ -480,7 +809,7 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
     //#if not defined(BOARD_T_DECK_PRO)
-    SX1262 radio = new Module(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
+    SX1262 radio = MC_RADIO_MODULE(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
     //#endif
 
 #endif
@@ -491,7 +820,7 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // If you have RESET of the E22 connected to a GPIO on the ESP you must initialize the GPIO as output and perform a LOW - HIGH cycle, 
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
-    SX1268 radio = new Module(SX1268_CS, SX1268_IRQ, SX1268_RST, SX1268_GPIO);
+    SX1268 radio = MC_RADIO_MODULE(SX1268_CS, SX1268_IRQ, SX1268_RST, SX1268_GPIO);
 
 #endif
 
@@ -501,7 +830,7 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // If you have RESET of the E22 connected to a GPIO on the ESP you must initialize the GPIO as output and perform a LOW - HIGH cycle, 
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
-    SX1262 radio = new Module(SX126x_CS, SX126x_IRQ, SX126x_RST, SX126x_GPIO);
+    SX1262 radio = MC_RADIO_MODULE(SX126x_CS, SX126x_IRQ, SX126x_RST, SX126x_GPIO);
 
 #endif
 
@@ -511,7 +840,7 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // If you have RESET of the E22 connected to a GPIO on the ESP you must initialize the GPIO as output and perform a LOW - HIGH cycle, 
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
-    SX1268 radio = new Module(SX126x_CS, SX126x_IRQ, SX126x_RST, SX126x_GPIO);
+    SX1268 radio = MC_RADIO_MODULE(SX126x_CS, SX126x_IRQ, SX126x_RST, SX126x_GPIO);
 
 #endif
 
@@ -522,13 +851,13 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
     //  begin(sck, miso, mosi, ss).
-    SX1262 radio = new Module(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
+    SX1262 radio = MC_RADIO_MODULE(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
 
 #endif
 
 
 #ifdef USING_SX1262 // BOARD_TBEAM_1W
-    SX1262 radio = new Module(RADIO_CS_PIN, RADIO_IRQ_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+    SX1262 radio = MC_RADIO_MODULE(RADIO_CS_PIN, RADIO_IRQ_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 #endif
 
 #ifdef SX1262_E290
@@ -538,19 +867,91 @@ LLCC68 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
     // otherwise your E22 is in an undefined state. RESET can be connected, but is not a must. IF so, make RESET before INIT!
 
     //  begin(sck, miso, mosi, ss).
-    SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO_1, PIN_LORA_NRST, PIN_LORA_BUSY);
+    SX1262 radio = MC_RADIO_MODULE(PIN_LORA_NSS, PIN_LORA_DIO_1, PIN_LORA_NRST, PIN_LORA_BUSY);
 
 #endif
 
 #ifdef SX1262_V4
     // RadioModule SX1262 for Heltec V4 (with external PA)
     // Same pins as V3, but requires PA control during transmit
-    SX1262 radio = new Module(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
+    SX1262 radio = MC_RADIO_MODULE(SX1262X_CS, SX1262X_IRQ, SX1262X_RST, SX1262X_GPIO);
 
 #endif
 
 // Lora callback Function declarations
 int checkRX(bool bRadio);
+#include "lora_rx_park.h"
+#if !defined(BOARD_T5_EPAPER)
+static void loraRxParkDrain(void);
+#endif
+
+// RX-silence diagnostics, ESP32 counterpart of nrf52_main.cpp. Every RX event (checkRXProcess())
+// and every radio action (CAD, own TX, RX restart) runs in the loop task, so the tracker is called directly
+// (no publish/forward step as on nRF52). Counters always run; prints and chip reads only under --loradebug.
+#include "rx_silence.h"
+#include "esp32_radio_diag.h"
+static RxSilenceTracker g_rxs;
+static uint32_t g_rxs_cad_busy = 0, g_rxs_cad_scans = 0, g_rxs_restarts = 0;
+
+// Chip mode name for the RX_SILENCE lines; "na" on SX127x boards (no SX126x chip read).
+__attribute__((unused)) static const char *rxsChipModeName(void)
+{
+#ifdef MC_RADIO_SX126X_FAMILY
+    Esp32RadioDiag d;
+    esp32RadioDiagRead(&radio, g_radio_mod, &d);
+    return esp32RadioChipModeName(d.chip_mode);
+#else
+    return "na";
+#endif
+}
+
+// RX event (successful RX with rssi/snr, or an RX error) at 'now'.
+__attribute__((unused)) static void rxsNoteEvent(bool has_q, int rssi, int snr)
+{
+    if(g_rxs.noteRx(millis()) && bLORADEBUG)
+    {
+        char sc[12], st[12], sr[12];
+        rxSilenceFmtSince(sc, sizeof(sc), g_rxs.end_since_cad_ms);
+        rxSilenceFmtSince(st, sizeof(st), g_rxs.end_since_tx_ms);
+        rxSilenceFmtSince(sr, sizeof(sr), g_rxs.end_since_restart_ms);
+        if(has_q)
+            Serial.printf("[MC-DBG] RX_SILENCE_END dur=%lu by=%s since_cad=%s since_tx=%s since_restart=%s rssi=%d snr=%d\n",
+                (unsigned long)g_rxs.end_dur_s, rxSilenceReasonName(g_rxs.end_reason), sc, st, sr, rssi, snr);
+        else
+            Serial.printf("[MC-DBG] RX_SILENCE_END dur=%lu by=%s since_cad=%s since_tx=%s since_restart=%s rssi=na snr=na\n",
+                (unsigned long)g_rxs.end_dur_s, rxSilenceReasonName(g_rxs.end_reason), sc, st, sr);
+    }
+}
+
+// Snapshot every RX_SILENCE_MS while silent. Loop task.
+__attribute__((unused)) static void rxsTick(void)
+{
+    uint32_t t_s = 0;
+    if(g_rxs.tick(millis(), &t_s) && bLORADEBUG)
+    {
+#ifdef MC_RADIO_SX126X_FAMILY
+        Esp32RadioDiag d;
+        esp32RadioDiagRead(&radio, g_radio_mod, &d);   // read-only SPI commands, RX stays armed
+        Serial.printf("[MC-DBG] RX_SILENCE t=%lu mode=%s drv=na st=0x%02X irq=0x%04X err=0x%04X rssi_inst=%d cad=%lu/%lu restarts=%lu boosted=%d\n",
+            (unsigned long)t_s, esp32RadioChipModeName(d.chip_mode), d.status, d.irq, d.err, (int)d.rssi_inst,
+            (unsigned long)g_rxs_cad_busy, (unsigned long)g_rxs_cad_scans,
+            (unsigned long)g_rxs_restarts, bBOOSTEDGAIN ? 1 : 0);
+#else
+        Serial.printf("[MC-DBG] RX_SILENCE t=%lu mode=na drv=na st=na irq=na err=na rssi_inst=na cad=%lu/%lu restarts=%lu boosted=%d\n",
+            (unsigned long)t_s, (unsigned long)g_rxs_cad_busy, (unsigned long)g_rxs_cad_scans,
+            (unsigned long)g_rxs_restarts, bBOOSTEDGAIN ? 1 : 0);
+#endif
+    }
+}
+
+// Boot counters for --info (read from command_functions.cpp, loop task): silences, longest s, total s.
+void rxSilenceGetStats(uint32_t *silences, uint32_t *longest_s, uint32_t *total_s)
+{
+    uint32_t now = millis();
+    *silences = g_rxs.silences;
+    *longest_s = g_rxs.longestNow(now);
+    *total_s = g_rxs.totalNow(now);
+}
 
 // save transmission state between loops
 volatile int transmissionState = RADIOLIB_ERR_UNKNOWN;
@@ -603,6 +1004,9 @@ void setFlagSent(void)
     if(bEnableInterruptReceive)
     {
         receiveFlag = true;
+#if INSTRUMENT_ENABLED
+        INSTR_IRQ_STAMP();      // R1-F: DIO1 -> readData latency
+#endif
     }
 
     if(bEnableInterruptTransmit)
@@ -640,6 +1044,14 @@ bool is_new_packet(uint8_t compBuffer[4]);     // switch if we have a packet rec
 #include "serial_command.h"
 // gatewayService_*() likewise (C4 carve-out)
 #include "gateway_service.h"
+#include "gw_reg_runtime.h"
+#include "wx_pins.h"
+#ifdef ENABLE_LTR390
+#include "ltr390.h"
+#endif
+#ifdef ENABLE_WIND
+#include "wind_counter.h"
+#endif
 
 bool g_meshcom_initialized;
 bool init_flash_done=false;
@@ -738,6 +1150,45 @@ static const char* wakeCauseName(esp_sleep_source_t c)
     }
 }
 
+uint32_t console_txbuf_bytes = 0;
+int      console_txbuf_ok    = 0;
+
+#if !ARDUINO_USB_CDC_ON_BOOT && (CONSOLE_UART_TXBUF > 0 || (defined(INSTR_UART_TXBUF) && INSTR_UART_TXBUF > 0))
+#include <driver/uart.h>
+static void console_txbuf_shutdown(void)
+{
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(100));
+}
+#endif
+
+void console_txbuf_apply(HardwareSerial &port)
+{
+    (void)port;
+#if !ARDUINO_USB_CDC_ON_BOOT && (CONSOLE_UART_TXBUF > 0 || (defined(INSTR_UART_TXBUF) && INSTR_UART_TXBUF > 0))
+    static bool s_done = false;
+    if (s_done)
+        return;
+    s_done = true;
+  #if defined(INSTR_UART_TXBUF) && INSTR_UART_TXBUF > 0
+    const size_t want = INSTR_UART_TXBUF;   // INSTRUMENT experiment override wins
+  #else
+    const size_t want = CONSOLE_UART_TXBUF;
+  #endif
+    console_txbuf_bytes = (uint32_t)want;
+    // arduino-esp32 2.0.17: must precede begin(); returns 0 once the port runs.
+    // want <= 128 (SOC_UART_FIFO_LEN) returns 128 and installs no ring: ok stays 0.
+    const size_t got = port.setTxBufferSize(want);
+    console_txbuf_ok = (want > 128 && got >= want) ? 1 : 0;
+    if (console_txbuf_ok)
+    {
+        // R2-F2/R1: bytes still queued in the driver ring would be lost on a deliberate
+        // restart. esp_restart() runs the shutdown handlers (IDF 4.4.7 esp_system.c);
+        // console is UART0 (Serial = HardwareSerial(0)). Bounded 100 ms.
+        esp_register_shutdown_handler(console_txbuf_shutdown);
+    }
+#endif
+}
+
 void esp32setup()
 {
     ///< Initialize T5-EPAPER GUI
@@ -753,8 +1204,15 @@ void esp32setup()
     // MeshSerialClass::begin() (src/net_console.cpp).
     Serial.setTxBufferSize(4096);
 #endif
+#if defined(DISABLE_NET_CONSOLE) && !ARDUINO_USB_CDC_ON_BOOT
+    // UART console: TX ring before the first begin() (with the net console
+    // compiled in, MeshSerialClass::begin() does this for s_hwSerial).
+    console_txbuf_apply(Serial);
+#endif
     Serial.begin(MONITOR_SPEED);
     Serial.setTimeout(50);
+    if(console_txbuf_bytes > 0)   // silent on boards where no ring applies (CDC)
+        printfdeb("[MC-INFO] CONSOLE_TXBUF bytes=%lu ok=%d\n", (unsigned long)console_txbuf_bytes, console_txbuf_ok);
 
 #if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE && defined(DISABLE_NET_CONSOLE)
     // CDC-01: without the net-console wrapper Serial is the HWCDC object
@@ -765,6 +1223,12 @@ void esp32setup()
 // 1.1.1??   pinMode(45,OUTPUT);
 // 1.1.1??    digitalWrite(45, LOW);
 
+    #if defined(BOARD_LED) && BOARD_LED_ACTIVE_LOW
+        // Active-low LED (common anode): a floating pad can glow until the gated init below (after the settings
+        // load). A pull-up holds it dark and does not load a OneWire/DHT bus on a shared pad.
+        pinMode(BOARD_LED, INPUT_PULLUP);
+    #endif
+
     // Wartet maximal 5 Sekunden auf den seriellen Monitor.
     // Achtung: delay() füttert den Task-Watchdog NICHT -- nur
     // esp_task_wdt_reset() tut das. Diese Schleife ist nur deshalb
@@ -774,15 +1238,7 @@ void esp32setup()
         delay(10);
     }
 
-    // Safe Hardware Initalization
-    #ifdef BOARD_LED
-        // Pre-load the safe execution state into the output register
-        // This prevents the LED from briefly flashing/glitching
-        // when changing the pin mode
-        digitalWrite(BOARD_LED, BOARD_LED_ACTIVE_LOW);
-        // configure the pin driver as active output:
-        pinMode(BOARD_LED, OUTPUT);
-    #endif
+    // Board LED pin init: after the settings load (LED-04, needs the OneWire state), see bUSER_BOARD_LED below
 
     #if defined(HAS_TFT_CONNECT)
 
@@ -894,6 +1350,7 @@ void esp32setup()
     }
 #if INSTRUMENT_ENABLED
     instrument_report_prev_boot();   // CDC-01: loop gaps of the previous boot, from RTC memory
+    instrument_onrx_boot();          // R1-F: [INS] UARTTXBUF / ONRX_READY
 #endif
 
     lFreeHeap =  ESP.getFreeHeap();
@@ -950,6 +1407,7 @@ void esp32setup()
     meshcom_settings.node_mversion = MODUL_HARDWARE;
     meshcom_settings.node_cleanflash = 0;
     snprintf(meshcom_settings.node_fwversion, sizeof(meshcom_settings.node_fwversion), "%-4.4s%-1.1s", SOURCE_VERSION, SOURCE_VERSION_SUB);
+    gwRegBoot();   // gateway registration state from settings (after the settings load)
 
 #if defined(ENABLE_MSGSTORE)
     // S3: store node -- glue first (installs the MsgStoreEnv), then the persisted
@@ -957,6 +1415,13 @@ void esp32setup()
     msgstoreGlueInit();
     msgstoreSettingsLoad();
 #endif
+
+    // BLK-01: call blocklist from flash/NVS (independent of ENABLE_MSGSTORE).
+    blockListLoad();
+
+    // RM-05 (#1189): remote-management state (high-water mark from its own NVS key), after the
+    // settings load so node_call/node_passwd are final.
+    rmInit();
 
     // "-0" und "-01" sind nicht die kanonische Schreibweise der SSID. Was aus
     // dem Flash kommt, wird deshalb einmal beim Start geradegezogen -- das
@@ -1041,8 +1506,23 @@ void esp32setup()
     bAnalogCheck = meshcom_settings.node_sset3 & 0x0008;
     bBMP3ON = meshcom_settings.node_sset3 & 0x0010;
     bAHT20ON = meshcom_settings.node_sset3 & 0x0020;
+    bUVON = meshcom_settings.node_wx_flags & 0x0001;     // WX-01: UV / wind switches
+    bWINDON = meshcom_settings.node_wx_flags & 0x0002;
     bAnalogFilter = meshcom_settings.node_sset3 & 0x0040;
     bUSER_BOARD_LED = meshcom_settings.node_sset3 & 0x0080;
+
+    #ifdef BOARD_LED
+        // Safe Hardware Initalization. LED-04: skipped while OneWire/DHT owns the pad (T-Beam: GPIO4)
+        if (boardLedPinUsable())
+        {
+            // Pre-load the safe execution state into the output register
+            // This prevents the LED from briefly flashing/glitching
+            // when changing the pin mode
+            digitalWrite(BOARD_LED, BOARD_LED_ACTIVE_LOW);
+            // configure the pin driver as active output:
+            pinMode(BOARD_LED, OUTPUT);
+        }
+    #endif
 
     bSOFTSERDEBUG = meshcom_settings.node_sset3 & 0x0100;
     bWXDEBUG = meshcom_settings.node_sset3 & 0x0200;
@@ -1272,7 +1752,9 @@ void esp32setup()
         if(meshcom_settings.node_sset == 0x0004)
         {
             bButtonCheck = true;
-            meshcom_settings.node_sset = meshcom_settings.node_sset | 0x0035;	// bDisplayPos = true, bButtonCheck = true, bGPSON = true
+            bGPSON = true;          // TRK-03: GPS schon beim ersten Start, nicht erst nach dem Reboot
+            bDisplayVolt = true;
+            meshcom_settings.node_sset = meshcom_settings.node_sset | TBEAM_FIRST_BOOT_SSET;	// TRK-03
             save_settings();
         }
     #endif
@@ -1334,6 +1816,16 @@ void esp32setup()
 
     #if defined(ENABLE_AHT20)
         setupAHT20(true);
+    #endif
+
+    #if defined(ENABLE_LTR390)
+        if(bUVON)
+            ltr390_found = ltr390Begin();
+    #endif
+
+    #if defined(ENABLE_WIND)
+        if(bWINDON && meshcom_settings.node_wind_pin != 0 && wxWindPinOk(meshcom_settings.node_wind_pin))
+            windBegin(meshcom_settings.node_wind_pin);
     #endif
 
     #if defined(ENABLE_SHT21)
@@ -1423,6 +1915,7 @@ void esp32setup()
     //
     #elif defined(HAS_TFT)
         initTFT();
+        heapMarkTft();
     #else
         initDisplay();
     #endif
@@ -1594,15 +2087,14 @@ void esp32setup()
         bRadio = false;
     #endif
 
-    //#if not defined(BOARD_T_DECK_PRO)
-    // extra source
+    #ifdef BOARD_COUNTRY
+        if(meshcom_settings.node_country == 0)
+            meshcom_settings.node_country = BOARD_COUNTRY;
+    #endif
+
     // > 4.34w we use EU8 instead of EU
     if(meshcom_settings.node_country == 0)
         meshcom_settings.node_country = 8;
-
-    #ifdef BOARD_COUNTRY
-        meshcom_settings.node_country = BOARD_COUNTRY;
-    #endif
 
     lora_setcountry(meshcom_settings.node_country);
 
@@ -1637,6 +2129,8 @@ void esp32setup()
     #else
     if(bRadio)
     {
+        g_rxs.init(millis());   // RX-silence tracker starts with the local radio
+
         #if defined(BOARD_WIRELESS_PAPER) || defined(BOARD_E290) || defined(BOARD_E213)
         if(radio.setTCXO(1.8) != RADIOLIB_ERR_NONE)
             printlndeb(F("[LoRa]...TCXO 1.8V konnte nicht gesetzt werden"));
@@ -1905,109 +2399,30 @@ void esp32setup()
 
     // Create the BLE Device & WiFiAP
     snprintf(cBLEName, sizeof(cBLEName), "M%s-%02x%02x-%s", g_ble_dev_name, dmac[1], dmac[0], meshcom_settings.node_call);
-    char cManufData[60]={0};
-    snprintf(cManufData, sizeof(cManufData), "MCM%s-%02x%02x-%s", g_ble_dev_name,  dmac[1], dmac[0], meshcom_settings.node_call);
-    
-    
+    snprintf(s_bleManuf, sizeof(s_bleManuf), "MCM%s-%02x%02x-%s", g_ble_dev_name,  dmac[1], dmac[0], meshcom_settings.node_call);
+
+
     const std::__cxx11::string strBLEName = cBLEName;
-    const std::__cxx11::string strBLEManufData = cManufData;
 
     printfdeb("[BLE ]...Device started with BLE-Name <%s>\n", strBLEName.c_str());
 
     bleQueue = xQueueCreate(5, sizeof(BleQueueItem));
 
+    // Phone rings on the heap (classic ESP32 with the AU BLE pause only; no-op elsewhere). Allocated
+    // with BLE start, released by esp32BlePause(). A failure here leaves the rings empty (frames for
+    // the phone are dropped); BLE itself still starts.
+    if(!phoneRingsAttach())
+        printfdeb("[BLE ]...phone rings: no memory, phone data dropped until next boot\n");
+
     #if !defined(DISABLE_BLE)   // opt-out -D DISABLE_BLE: board without a usable BLE controller
-    NimBLEDevice::init(strBLEName);
-
-    printfdeb("[BLE ]...Device-Address <%s>\n", NimBLEDevice::toString().c_str());
-    
-    //NimBLEDevice::setDeviceName(strBLEName);
-
-    NimBLEDevice::setPower(9); // +9dbm
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-    NimBLEDevice::setSecurityAuth(false, false, false);
-    
-    /*if(meshcom_settings.bt_code >= 100000 && meshcom_settings.bt_code <= 999999)
-        NimBLEDevice::setSecurityPasskey(meshcom_settings.bt_code);
-    else
-        NimBLEDevice::setSecurityPasskey(PIN);*/
-
-#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
-#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-
-    // Create the BLE Server
-    pServer = NimBLEDevice::createServer();
-    pServer->setCallbacks(&serverCallbacks);
-    pServer->advertiseOnDisconnect(true);
-
-    // Create the BLE Service
-    pService = pServer->createService(SERVICE_UUID);
-
-    // Create a BLE Characteristic
-    pTxCharacteristic = pService->createCharacteristic(
-                        CHARACTERISTIC_UUID_TX,
-                        NIMBLE_PROPERTY::WRITE  |
-                        // Require a secure connection for read and write access
-                        //NIMBLE_PROPERTY::WRITE_AUTHEN |  // only allow writing if paired / encrypted
-                        //NIMBLE_PROPERTY::WRITE_ENC |  // only allow writing if paired / encrypted
-                        NIMBLE_PROPERTY::READ   |
-                        //NIMBLE_PROPERTY::READ_ENC |  // only allow reading if paired / encrypted
-                        //NIMBLE_PROPERTY::READ_AUTHEN |
-                        NIMBLE_PROPERTY::NOTIFY );
-
-    NimBLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
-                        CHARACTERISTIC_UUID_RX,
-                        NIMBLE_PROPERTY::WRITE  |
-                        // Require a secure connection for read and write access
-                        //NIMBLE_PROPERTY::WRITE_AUTHEN |  // only allow writing if paired / encrypted
-                        //NIMBLE_PROPERTY::WRITE_ENC |  // only allow writing if paired / encrypted
-                        NIMBLE_PROPERTY::READ   |
-                        //NIMBLE_PROPERTY::READ_ENC |  // only allow reading if paired / encrypted
-                        //NIMBLE_PROPERTY::READ_AUTHEN |
-                        NIMBLE_PROPERTY::NOTIFY );
-
-    pRxCharacteristic->setCallbacks(&chrCallbacks);
-
-    // Start the service
-    pService->start();
-
-    // Start advertising
-    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-    pAdvertising->reset();
-
-    std::string advName = strBLEName;
-    if(!bBLElong && advName.size() > 26)
-      advName = advName.substr(0, 26); // keep first 26 chars for short adverts
-
-    pAdvertising->setName(advName);  // BLE Local Name (possibly shortened)
-
-    if (bBLElong)
-    {
-        pAdvertising->setManufacturerData(strBLEManufData);
-        pAdvertising->addServiceUUID(SERVICE_UUID);
-    }
-    else
-    {
-        // For short adverts we skip adding the 128-bit service UUID which
-    
-    }
-
-    if (bBLElong)
-        pAdvertising->enableScanResponse(true);
-    else
-        pAdvertising->enableScanResponse(false);
-    
+    s_bleLife = xSemaphoreCreateMutex();   // AU-10: guards the BLE objects against pause / resume
     #if defined(BENCH_BLE_ADV_LATE)
-    // TM-11 experiment: advertising starts in esp32loop() once [BOOT];ready
-    // fired (WiFi joined or given up) -- TD-01 hypothesis: BLE advertising
-    // during the first association attempt makes it fail.
-    printfdeb("[BLE ]...advertising deferred until the network phase settled (BENCH_BLE_ADV_LATE)\n");
+    const bool bleAdvNow = false;
     #else
-    pAdvertising->start();
+    const bool bleAdvNow = true;
     #endif
- 
-    printfdeb("[BLE ]...Waiting a client connection to notify...\n");
+    bleStackStart(bleAdvNow);   // the same function the AU-10 resume uses
+    heapMarkBle();
     #else
     printfdeb("[BLE ]...disabled (DISABLE_BLE)\n");
     #endif
@@ -2033,7 +2448,9 @@ void esp32setup()
 
     ///////////////////////////////////////////////////////
     // WIFI
-    if(bGATEWAY || bEXTUDP || bWEBSERVER || bNETCONSOLE)
+    // AU-05 (#1187): the firmware auto update needs the STA link on its own, independent of the gateway flag.
+    // D15: for AU alone only with an SSID set and not in AP mode (wifi_start_gate.h)
+    if(wifiStartWanted(bGATEWAY, bEXTUDP, bWEBSERVER, bNETCONSOLE, meshcom_settings.node_autoupd, bWIFIAP, meshcom_settings.node_ssid))
     {
         bAllStarted=false;
 
@@ -2109,13 +2526,24 @@ BlePhoneSend esp32_write_ble(const uint8_t *buf, uint16_t len)
     if(bBLEDEBUG)
         printfdeb("[LOOP] <%lu> WRITE BLE\n", millis());
 
-    if(!deviceConnected || g_ble_conn_handle == 0xFFFF || pTxCharacteristic == nullptr)
+    if(!deviceConnected || g_ble_conn_handle == 0xFFFF)
         return BLE_SEND_DOWN;
+
+    // AU-10: the stack and pTxCharacteristic are gone while the update job has BLE paused
+    // (that only happens with no phone connected, so this is a race guard, not a normal path)
+    if(!bleLifeLock())
+        return BLE_SEND_DOWN;
+    if(pTxCharacteristic == nullptr)
+    {
+        bleLifeUnlock();
+        return BLE_SEND_DOWN;
+    }
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, len);
     int rc = BLE_HS_ENOMEM;
     if(om != nullptr)
         rc = ble_gatts_notify_custom(g_ble_conn_handle, pTxCharacteristic->getHandle(), om);   // frees om
+    bleLifeUnlock();
 
     if(rc == 0)
         return BLE_SEND_SENT;
@@ -2135,7 +2563,11 @@ uint16_t esp32_ble_mtu()
     #else
     if(!deviceConnected || g_ble_conn_handle == 0xFFFF)
         return 0;
-    return (uint16_t)ble_att_mtu(g_ble_conn_handle);
+    if(!bleLifeLock())   // AU-10: no host calls while the stack is stopped
+        return 0;
+    const uint16_t mtu = (uint16_t)ble_att_mtu(g_ble_conn_handle);
+    bleLifeUnlock();
+    return mtu;
     #endif
 }
 
@@ -2146,6 +2578,8 @@ uint16_t esp32_ble_mtu()
 // is needed -- OnRxDone runs inside esp32loop() on ESP32, so producer and
 // consumer are one task. Factored so both
 // the local-radio loop and the external-radio path flush pending RX displays.
+// the T5 drives its e-paper from its own task; the only other caller is the external-radio drain
+#if !defined(BOARD_T5_EPAPER) || defined(EXTERNAL_RADIO)
 static void flushDeferredDisplayUpdates()
 {
     bool _pendText = bPendingDisplayText;
@@ -2164,6 +2598,589 @@ static void flushDeferredDisplayUpdates()
     if(_pendText) sendDisplayText(_msg, _rssi, _snr);
     if(_pendPos)  sendDisplayPosition(_msg, _rssi, _snr);
 }
+#endif
+
+// ---------------------------------------------------------------------------
+// AU-05 (#1187): firmware auto update, loop side. Once per second, from esp32loop().
+// The decisions live in src/fw_update.h (fwTick, fwAttemptAllowed ...); the network
+// work (CHECK, DOWNLOAD) runs in its own task behind src/esp32/fw_update_net.h. This
+// function only feeds the policy and starts jobs; FW_HANDOVER reboots into Safeboot
+// through auRebootToSafeboot() (command_functions.cpp, shared with --ota-update).
+// ---------------------------------------------------------------------------
+static FwTimer s_auTimer;
+static bool s_auTimerInit = false;
+static uint32_t s_auLastTickMs = 0;
+static uint32_t s_auNextTryMs = 0;      // back-off after fwNetStart() refused (busy / no link)
+static bool s_auBackoff = false;
+static bool s_auSawBusy = false;        // a job was observed running and its result is not consumed yet
+static char s_auNotifiedTag[24] = "";   // [AU];notify printed for this tag
+static char s_auHandoverTag[24] = "";   // [AU];handover printed for this tag
+#if AU_AUTO_INSTALL
+static bool s_auBlockedPrinted = false; // [AU];handover;blocked;old_safeboot printed this boot
+#endif
+static bool s_auSkipLogged = false;     // D9: [AU];auto;skip / blocked printed for this check
+// auRequestApplyReboot(): flag + request time; auTick performs the reboot >= 500 ms later
+static volatile bool s_auApplyRebootReq = false;
+static volatile uint32_t s_auApplyRebootAtMs = 0;
+
+void auRequestApplyReboot(void)
+{
+    s_auApplyRebootAtMs = millis();   // time first, flag second: the loop reads them in the other order
+    s_auApplyRebootReq = true;
+}
+
+// fwNetStart() refuses new jobs while the requested reboot is still waiting for its 500 ms.
+bool auApplyRebootPending(void)
+{
+    return s_auApplyRebootReq;
+}
+
+static bool auTagSame(const char *a, const char *b)
+{
+    return strncmp(a, b, 23) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// BLE guard (spec 7) and service shedding (spec 8.1). Loop task only, except the reads noted.
+// ---------------------------------------------------------------------------
+static uint32_t s_guardSetMs = 0;
+static bool s_guardChain = false;       // the CHECK was requested with a chain and no DOWNLOAD started yet
+static bool s_guardSawBusy = false;     // a job of this guard was started (BUSY is set synchronously by fwNetStart)
+static volatile uint8_t s_auShedMask = 0;   // spec 8.1 step 3: FW_SHED_* bits the loop keeps stopped (KISS TCP, net console)
+
+bool auBleGuardActive(void)
+{
+#if AU_BLE_PAUSE
+    return s_bleGuard;
+#else
+    return false;   // no guard off the classic ESP32 (forced NimBLE deinit is not safe on the S3)
+#endif
+}
+
+// Spec 8.1 step 3 (job task). The services the node could stop now (FW_SHED_* bits): a connected net console
+// session, KISS TCP when on. Read only.
+uint8_t auShedAvail(void)
+{
+    uint8_t mask = 0;
+    #ifndef DISABLE_NET_CONSOLE
+    if(isNetConsoleConnected())
+        mask |= FW_SHED_CONSOLE;
+    #endif
+    #ifndef DISABLE_KISS_TCP
+    if(bKISS)
+        mask |= FW_SHED_KISS;
+    #endif
+    #if defined(HAS_TFT)
+    if(tftSpriteActive())
+        mask |= FW_SHED_TFT;   // AU-21: the loop can release the 25.6 KB sprite
+    #endif
+    return mask;
+}
+
+// Keep the services of mask stopped through the same off paths as `--netconsole off` and `--kiss off` (the loop does
+// the stopping: sockets are only touched by the loop task). mask 0 restores both (the loop reopens them).
+void auShedHold(uint8_t mask)
+{
+    s_auShedMask = mask;
+}
+
+// True once the sockets of mask are closed (the loop has run the off paths).
+bool auShedSettled(uint8_t mask)
+{
+    bool consoleUp = false;
+    bool kissUp = false;
+    #ifndef DISABLE_NET_CONSOLE
+    consoleUp = isNetConsoleConnected();
+    #endif
+    #ifndef DISABLE_KISS_TCP
+    kissUp = isKissClientConnected();
+    #endif
+    bool tftUp = false;
+    #if defined(HAS_TFT)
+    tftUp = tftSpriteActive();
+    #endif
+    return fwShedSettled(mask, consoleUp, kissUp, tftUp);
+}
+
+
+#if AU_BLE_PAUSE
+static bool auBleGuardStart(bool chainDownload, bool dueReason)
+{
+    if(s_bleGuard)
+        return false;
+    FwNetStatus st;
+    fwNetGetStatus(st);
+    if(st.state == FWS_BUSY)
+        return false;
+    const unsigned phone = (deviceConnected || isPhoneReady != 0) ? 1u : 0u;
+    // set before the job starts: the job task reads the flag when it begins
+    s_bleGuard = true;
+    s_guardSetMs = millis();
+    s_guardChain = chainDownload;
+    s_guardSawBusy = false;
+    if(dueReason)
+        Serial.printf("[AU];bleguard;on;phone;%u;reason;due\n", phone);
+    else
+        Serial.printf("[AU];bleguard;on;phone;%u\n", phone);
+    if(!fwNetStart(FWJ_CHECK, (uint8_t)meshcom_settings.node_updchan))
+    {
+        s_bleGuard = false;
+        s_guardChain = false;
+        Serial.printf("[AU];bleguard;off;refused\n");
+        return false;
+    }
+    s_guardSawBusy = true;
+    s_auSawBusy = true;
+    return true;
+}
+#endif   // AU_BLE_PAUSE
+
+bool auBleGuardRequest(bool chainDownload)
+{
+#if AU_BLE_PAUSE
+    return auBleGuardStart(chainDownload, false);
+#else
+    (void)chainDownload;
+    return false;
+#endif
+}
+
+static void auBleGuardRelease(FwGuardAct act)
+{
+    s_bleGuard = false;
+    s_guardChain = false;
+    s_guardSawBusy = false;
+    switch(act)
+    {
+    case FWG_REL_DONE:      Serial.printf("[AU];bleguard;off;done\n"); break;
+    case FWG_REL_FAIL:      Serial.printf("[AU];bleguard;off;fail\n"); break;
+    case FWG_REL_REFUSED:   Serial.printf("[AU];bleguard;off;refused\n"); break;
+    default:                Serial.printf("[AU];bleguard;off;watchdog\n"); break;
+    }
+    // the job task left BLE down while the guard was set; a failed resume is retried by the loop
+    if(esp32BleDown())
+        esp32BleResume();
+}
+
+// Effective update mode (D14: a stored 2 acts as 1).
+static int auEffectiveMode(void)
+{
+    const int storedMode = meshcom_settings.node_autoupd < 0 ? 0 : (meshcom_settings.node_autoupd > 2 ? 2 : meshcom_settings.node_autoupd);
+    return fwEffectiveMode(storedMode);
+}
+
+// "[AU];notify;<tag>" for a finished CHECK that found a newer release, once per tag. Called by the result block of
+// auTick and by the guard chain before it starts the DOWNLOAD (that DOWNLOAD hides the CHECK result in the same tick).
+static void auNotifyCheck(const FwNetStatus &st)
+{
+    if(!fwNotifyDue(st.job == FWJ_CHECK && st.state == FWS_DONE_OK, st.availNewer, auEffectiveMode(),
+                    auTagSame(s_auNotifiedTag, st.availTag)))
+        return;
+    snprintf(s_auNotifiedTag, sizeof(s_auNotifiedTag), "%s", st.availTag);
+    // Serial.printf, not printfdeb: the latter strips ';' outside --debug csv
+    Serial.printf("[AU];notify;%s\n", st.availTag);
+}
+
+// 1 Hz, before every early return of auTick: chain / release the guard, drop a shed hold nobody owns.
+static void auGuardTick(uint32_t now)
+{
+    FwNetStatus st;
+    fwNetGetStatus(st);
+    const bool busy = (st.state == FWS_BUSY);
+    if(s_auShedMask != 0 && !busy)
+        s_auShedMask = 0;   // the job task restores at its end; this is the backstop
+    if(!s_bleGuard)
+        return;
+
+    const bool ended = !busy && s_guardSawBusy && (st.state == FWS_DONE_OK || st.state == FWS_DONE_FAIL);
+    const bool failed = (st.state == FWS_DONE_FAIL);
+    const bool chainPending = s_guardChain && st.job == FWJ_CHECK;
+    const bool stagedSame = st.staged && st.stagedTag[0] != '\0' && strncmp(st.stagedTag, st.availTag, 23) == 0;
+    const bool chainOk = fwGuardChainOk(st.availNewer, st.installable, st.availTag[0] != '\0', stagedSame);
+    const FwGuardAct act = fwGuardStep(true, busy, ended, failed, failed && fwGuardRefusedErr(st.lastErr),
+                                       chainPending, chainOk, now, s_guardSetMs);
+    if(act == FWG_HOLD)
+        return;
+    if(act == FWG_CHAIN_DOWNLOAD)
+    {
+        s_guardChain = false;
+        auNotifyCheck(st);   // the DOWNLOAD below turns BUSY before auTick reads the CHECK result
+        if(fwNetStart(FWJ_DOWNLOAD, (uint8_t)meshcom_settings.node_updchan))
+        {
+            s_guardSawBusy = true;
+            s_auSawBusy = true;
+        }
+        else
+            auBleGuardRelease(FWG_REL_FAIL);
+        return;
+    }
+    auBleGuardRelease(act);
+}
+
+// 30 s pause after fwNetStart() said no, so a refused start is not retried every second.
+// Wrap-safe: the flag is cleared when the deadline is reached (1 Hz caller).
+static bool auBackedOff(uint32_t now)
+{
+    if(s_auBackoff && (int32_t)(now - s_auNextTryMs) >= 0)
+        s_auBackoff = false;
+    return s_auBackoff;
+}
+static void auBackOff(uint32_t now)
+{
+    s_auNextTryMs = now + 30000u;
+    s_auBackoff = true;
+}
+
+// True if a handover for `tag` was already attempted this boot (auHandoverRecord is a no-op then).
+bool auHandoverAttempted(const char *tag)
+{
+    return tag != nullptr && tag[0] != '\0' && s_auHandoverTag[0] != '\0' && auTagSame(s_auHandoverTag, tag);
+}
+
+// The handover sequence, shared by the auto path (FW_HANDOVER) and the remote go. One attempt per tag
+// and boot (s_auHandoverTag); does not return on success. Returns false if the attempt failed (nvs).
+static bool auHandoverRecord(const FwStageRecord &rec)
+{
+    if(auTagSame(s_auHandoverTag, rec.tag))
+        return true;
+    snprintf(s_auHandoverTag, sizeof(s_auHandoverTag), "%s", rec.tag);
+    // AU-16: a DIO bootloader never reaches the Safeboot; refuse before the marker is written
+    if(!fwNetBootloaderQio())
+    {
+        Serial.printf("[AU];handover;blocked;bootloader_dio\n");
+        return false;
+    }
+    // the "hand" marker goes in BEFORE the reboot: it is how the next boot tells an old
+    // Safeboot (record untouched) from a new one (marker consumed)
+    if(!fwNetMarkHandover(rec.tag))
+    {
+        Serial.printf("[AU];fail;nvs\n");
+        return false;
+    }
+    Serial.printf("[AU];handover;%s\n", rec.tag);
+    if(!auRebootToSafeboot())
+    {
+        // hopeless (no Safeboot partition, or it cannot be set as boot partition): drop the
+        // record so the next boot does not try again, and the staged flag no longer fires.
+        // AU-16: a DIO bootloader was already reported by the guard; the record is dropped the same way
+        if(fwNetBootloaderQio())
+            Serial.printf("[AU];fail;nosafeboot\n");
+        fwNetClearRecord();
+    }
+    return true;
+}
+
+static void auTick(void)
+{
+    const uint32_t now = millis();
+
+    // web "Install now": the answer is out, the node reboots into Safeboot (not throttled to 1 Hz)
+    if(fwApplyRebootDue(s_auApplyRebootReq, s_auApplyRebootAtMs, now))
+    {
+        s_auApplyRebootReq = false;
+        // a console / RM job may have started inside the 500 ms window (fwNetStart refuses new ones since the
+        // request, this catches one that slipped in before it): do not reboot under a running job
+        FwNetStatus auNow;
+        fwNetGetStatus(auNow);
+        if(fwApplyRebootAct(true, auNow.state == FWS_BUSY) == FWAPPLY_ABORT_BUSY)
+        {
+            fwNetUnmarkHandover();
+            Serial.printf("[AU];apply;abort;busy\n");
+            return;
+        }
+        Serial.printf("[AU];apply;reboot\n");
+        if(!auRebootToSafeboot())   // returns only without a usable Safeboot partition
+        {
+            fwNetUnmarkHandover();
+            if(fwNetBootloaderQio())   // AU-16: the DIO guard has reported itself
+                Serial.printf("[ERR];update;no safeboot partition\n");
+        }
+        return;
+    }
+
+    if((uint32_t)(now - s_auLastTickMs) < 1000u)
+        return;
+    s_auLastTickMs = now;
+    auGuardTick(now);
+
+    // AU-12: boot demotion, once per boot at the first tick (settings are loaded long before). A node
+    // that was in auto mode with a Safeboot too old to apply updates drops to notify and says so. Only
+    // auto mode triggers the Safeboot partition scan here (cached by fwNetSafebootVersion; the web pages and
+    // --update status trigger it too, once per boot). The setting is written once; there is no reboot and no retry.
+    static bool s_auBootCapChecked = false;
+    if(!s_auBootCapChecked)
+    {
+        s_auBootCapChecked = true;
+        if(meshcom_settings.node_autoupd == 2 && !fwNetSafebootCapable())
+        {
+            meshcom_settings.node_autoupd = 1;
+            save_settings();
+            // Serial.printf, not printfdeb: the latter strips ';' outside --debug csv
+            if(!fwNetBootloaderQio())
+                Serial.printf("[AU];refuse;bootloader_dio;mode;notify;renew with the web flasher\n");
+            else
+                Serial.printf("[AU];refuse;safeboot_too_old;mode;notify;ver;%d;need;%d\n", fwNetSafebootVersion(), AU_SAFEBOOT_MIN);
+        }
+    }
+
+    // WiFi STA with an address (the Ethernet path is not an AU transport)
+    const bool wifiUp = (WiFi.status() == WL_CONNECTED) && ((uint32_t)WiFi.localIP() != 0u);
+
+    if(wifiUp && !s_auTimerInit)
+    {
+        fwTimerInit(s_auTimer, now, (uint32_t)ESP.getEfuseMac());
+        s_auTimerInit = true;
+    }
+    if(!s_auTimerInit && !rmAuGoArmed())   // a remote go needs no timer (works with auto-update off)
+        return;
+
+    FwPolicyIn in;
+    const int storedMode = meshcom_settings.node_autoupd < 0 ? 0 : (meshcom_settings.node_autoupd > 2 ? 2 : meshcom_settings.node_autoupd);
+    in.mode = (uint8_t)fwEffectiveMode(storedMode);   // D14: a stored 2 (auto) acts as 1 (notify)
+    in.wifiUp = wifiUp;
+    // clock valid for TLS and phone state: one definition, shared with rmAuGo (rm_au_esp32.cpp)
+    rmAuAutoGates(&in.timeValid, &in.phoneConnected);
+    in.phoneConnected = fwGuardPhoneConnected(in.phoneConnected, s_bleGuard);   // spec 7.5
+    // global_batt is the filtered pack voltage in mV; "no reading" = 0 mV = mains / USB. The same
+    // fail-safe as the /B= tag: battHardwarePresent() is false without a battery reading.
+    in.onBattery = battHardwarePresent();
+    in.battMv = (uint16_t)(global_batt <= 0.0f ? 0.0f : (global_batt > 65000.0f ? 65000.0f : global_batt));
+    // Node time is UTC + node_utcoff; with a TZ-01 rule node_utcoff is re-derived from it, so this
+    // is the rule's local time (UTC without a rule and offset 0).
+    {
+        int h = meshcom_settings.node_date_hour, m = meshcom_settings.node_date_minute;
+        in.localMinuteOfDay = (uint16_t)((h < 0 || h > 23 || m < 0 || m > 59) ? 0 : h * 60 + m);
+    }
+    const bool battOk = !in.onBattery || in.battMv >= FW_BATT_FLOOR_MV;   // AU-D17
+
+    FwNetStatus st;
+    fwNetGetStatus(st);
+
+    // ---- consume the result of a finished job (also one started by --update) ----
+    if(st.state == FWS_BUSY)
+        s_auSawBusy = true;
+    else if(s_auSawBusy && (st.state == FWS_DONE_OK || st.state == FWS_DONE_FAIL))
+    {
+        s_auSawBusy = false;
+        if(st.job == FWJ_DOWNLOAD && st.state == FWS_DONE_FAIL)
+        {
+            if(fwErrConsumesAttempt(st.lastErr))
+                fwAttemptFailed(s_auTimer, st.availTag, now);
+            else
+            {
+                // lowheap (classic ESP32 with a phone on BLE): transient, no attempt used; wait 10 min
+                auBackOff(now);
+                s_auNextTryMs = now + 600000u;
+            }
+        }
+        auNotifyCheck(st);
+    }
+    if(st.state == FWS_BUSY)
+        return;
+
+    // ---- remote go (RM1 "upd go"): independent of node_autoupd, the update window and the check timer ----
+    {
+        char goTag[24];
+        bool goDelayPassed = false;
+        static char s_goWaitReason[16] = "";
+        if(rmAuGoGet(goTag, &goDelayPassed, now))
+        {
+            const bool stagedMatch = st.staged && auTagSame(st.stagedTag, goTag);
+            FwGoTickIn gt;
+            memset(&gt, 0, sizeof(gt));
+            gt.busy = (st.state == FWS_BUSY);
+            gt.downloadFailed = (st.job == FWJ_DOWNLOAD && st.state == FWS_DONE_FAIL);
+            gt.stagedMatch = stagedMatch;
+            gt.attempted = auHandoverAttempted(goTag);
+            gt.delayPassed = goDelayPassed;
+            gt.ready = fwGoHandoverReady(in);
+            gt.phoneConnected = in.phoneConnected;
+            gt.safebootCapable = fwNetSafebootCapable();
+            gt.recordState = FWGO_REC_UNCHECKED;
+            FwStageRecord grec;
+            FwGoStep step = fwGoTickStep(gt);
+            if(step == FWGOS_NEED_RECORD)
+            {
+                // the record is read last: re-validated here, and it must carry the go tag
+                gt.recordState = !fwNetLoadRecord(grec) ? FWGO_REC_MISSING : (auTagSame(grec.tag, goTag) ? FWGO_REC_OK : FWGO_REC_TAG_DIFFERS);
+                step = fwGoTickStep(gt);
+            }
+            const char *wait = nullptr;
+            bool failed = true;   // literal format strings: the log lines stay greppable
+            switch(step)
+            {
+            case FWGOS_WAIT_DOWNLOAD:   wait = "download"; failed = false; break;
+            case FWGOS_WAIT_REPLY:      wait = "reply"; failed = false; break;
+            case FWGOS_WAIT_PHONE:      wait = "phone"; failed = false; break;
+            case FWGOS_WAIT_BATTERY:    wait = "battery"; failed = false; break;
+            case FWGOS_FAIL_DOWNLOAD:   Serial.printf("[AU];remote;fail;download\n"); break;
+            case FWGOS_FAIL_NOSTAGE:    Serial.printf("[AU];remote;fail;nostage\n"); break;
+            case FWGOS_FAIL_ATTEMPTED:  Serial.printf("[AU];remote;fail;attempted\n"); break;
+            case FWGOS_FAIL_SAFEBOOT:   Serial.printf("[AU];remote;fail;safeboot\n"); break;
+            case FWGOS_FAIL_NORECORD:   Serial.printf("[AU];remote;fail;norecord\n"); break;
+            case FWGOS_HANDOVER:
+                Serial.printf("[AU];remote;go;%s\n", goTag);
+                rmAuGoDisarm();
+                if(!auHandoverRecord(grec))
+                    Serial.printf("[AU];remote;fail;nvs\n");
+                return;
+            default: failed = false; break;
+            }
+            if(failed)
+                rmAuGoDisarm();
+            else
+            {
+                if(wait != nullptr && strcmp(wait, s_goWaitReason) != 0)
+                {
+                    snprintf(s_goWaitReason, sizeof(s_goWaitReason), "%s", wait);
+                    Serial.printf("[AU];remote;wait;%s\n", wait);
+                }
+                else if(wait == nullptr)
+                    s_goWaitReason[0] = '\0';
+            }
+        }
+        else
+            s_goWaitReason[0] = '\0';
+    }
+
+    if(!s_auTimerInit)
+        return;
+
+    FwAction act = fwTick(s_auTimer, in, fwNetStagedPending(), now);
+
+#if AU_AUTO_INSTALL
+    if(act == FW_HANDOVER)
+    {
+        // AU-08: reboot into Safeboot, which applies the staged image. The record is re-read and
+        // re-validated here (fwNetLoadRecord drops a stale one and clears the cached flag, so a
+        // gone record ends the handovers). One attempt per tag and boot: if there is no Safeboot
+        // partition the function returns and the tick must not retry every second.
+        // old Safeboot (too old by version scan, or it ignored the last handover): no automatic handover, or every update window
+        // would reboot the node into the same dead end. --update apply still tries.
+        if(!fwNetSafebootCapable())   // AU-12: version scan + nocap backstop
+        {
+            if(!s_auBlockedPrinted)
+            {
+                s_auBlockedPrinted = true;
+                if(fwNetBootloaderQio())
+                    Serial.printf("[AU];handover;blocked;old_safeboot\n");
+                else
+                    Serial.printf("[AU];handover;blocked;bootloader_dio\n");
+            }
+            return;
+        }
+        if(st.staged && st.stagedTag[0] && auTagSame(s_auHandoverTag, st.stagedTag))
+            return;   // already attempted this boot: no NVS read every second
+        FwStageRecord rec;
+        if(!fwNetLoadRecord(rec))
+            return;
+        auHandoverRecord(rec);
+        return;
+    }
+#endif   // AU_AUTO_INSTALL
+
+    if((act == FW_CHECK || act == FW_CHECK_GUARDED) && !auBackedOff(now))
+    {
+        // D16: the phone stayed connected 30 min past the due time: run this period's check under the BLE guard
+        // (the job force-pauses BLE, the guard is released when the check is done). No automatic download (D14).
+        // Without AU_BLE_PAUSE (ESP32-S3 etc.) there is no guard: the plain check below runs, as before W4.
+        #if AU_BLE_PAUSE
+        if(act == FW_CHECK_GUARDED)
+        {
+            if(auBleGuardStart(false, true))
+            {
+                fwCheckDone(s_auTimer, now);
+                s_auSkipLogged = false;
+            }
+            else
+                auBackOff(now);
+            return;
+        }
+        #endif
+        if(fwNetStart(FWJ_CHECK, (uint8_t)meshcom_settings.node_updchan))
+        {
+            fwCheckDone(s_auTimer, now);
+            s_auSawBusy = true;
+            s_auSkipLogged = false;
+        }
+        else
+            auBackOff(now);
+        return;
+    }
+
+    // stored mode 2 (auto): a CHECK found a newer, installable release (matching .autoupdate asset and digest)
+    // that is not staged yet -> DOWNLOAD (AU-D17: battery floor). A release without the asset must not
+    // consume the 3 attempts of AU-D5. Mode 1 never gets here: it only prints the notify line.
+    // D14: the automatic download is not compiled (AU_AUTO_INSTALL 0); where it would be due, the node says
+    // why it does not start (D9), once per check.
+    if(storedMode == 2 && st.availNewer && st.installable && st.availTag[0] && wifiUp)
+    {
+        const bool alreadyStaged = st.staged && auTagSame(st.stagedTag, st.availTag);
+        const char *skip = fwAutoSkipReason(AU_AUTO_INSTALL != 0, in.timeValid, in.phoneConnected, battOk,
+                                            auBackedOff(now), fwAttemptAllowed(s_auTimer, st.availTag, now), alreadyStaged);
+        if(skip == nullptr)
+        {
+#if AU_AUTO_INSTALL
+            if(fwNetStart(FWJ_DOWNLOAD, (uint8_t)meshcom_settings.node_updchan))
+                s_auSawBusy = true;
+            else
+                auBackOff(now);
+#endif   // AU_AUTO_INSTALL
+        }
+        else if(!s_auSkipLogged)
+        {
+            s_auSkipLogged = true;
+            // Serial.printf, not printfdeb: the latter strips ';' outside --debug csv
+            Serial.printf("[AU];auto;skip;%s\n", skip);
+            if(!AU_AUTO_INSTALL)
+                Serial.printf("[AU];auto;blocked;notify only\n");
+        }
+    }
+}
+
+#if defined(HAS_TFT)
+// AU-21: the loop owns the TFT sprite. Released while the update job holds FW_SHED_TFT or the stored display
+// setting is off (bDisplayOff, not the screensaver); never re-acquired while an AU job runs. A failed acquire retries
+// at most every 30 s, a transition (hold ends, display on again) retries at once. Nothing else creates the
+// sprite: displayTFT is a no-op without it and initTFT runs once at boot.
+static void tftSpriteReconcile(void)
+{
+    static bool lastHeld = false;
+    static bool lastOff = false;
+    static unsigned long lastTry = 0;
+    static bool tried = false;
+
+    const bool held = (s_auShedMask & FW_SHED_TFT) != 0;
+    bool busy = false;
+    if(!bDisplayOff && !held)   // only then can a running job change the verdict
+    {
+        FwNetStatus st;
+        fwNetGetStatus(st);
+        busy = (st.state == FWS_BUSY);
+    }
+    const bool wanted = fwTftSpriteWanted(bDisplayOff, held, busy);
+    const bool transition = (lastHeld && !held) || (lastOff && !bDisplayOff);
+    lastHeld = held;
+    lastOff = bDisplayOff;
+
+    if(!wanted && tftSpriteActive())
+    {
+        tftSpriteRelease();
+        if(held && !bDisplayOff)
+            tftShowUpdating();
+    }
+    else if(wanted && !tftSpriteActive())
+    {
+        if(transition || !tried || (millis() - lastTry) >= 30000UL)
+        {
+            tried = true;
+            lastTry = millis();
+            if(tftSpriteAcquire() && !bDisplayIsOff)
+                sendDisplayHead(true);   // full redraw of the current page
+        }
+    }
+}
+#endif
 
 void esp32loop()
 {
@@ -2190,14 +3207,22 @@ void esp32loop()
             Serial.printf("[BOOT];ready;ms;%lu;ip;%d\n", (unsigned long)millis(),
                           (hasIPaddress || meshcom_settings.node_hasIPaddress) ? 1 : 0);
             #if defined(BENCH_BLE_ADV_LATE) && !defined(DISABLE_BLE)
-            NimBLEDevice::getAdvertising()->start();
-            Serial.printf("[BLE ];advertising;started;ms;%lu\n", (unsigned long)millis());
+            if(bleLifeLock())   // AU-10: BLE may be paused by an update job
+            {
+                NimBLEDevice::getAdvertising()->start();
+                bleLifeUnlock();
+                Serial.printf("[BLE ];advertising;started;ms;%lu\n", (unsigned long)millis());
+            }
             #endif
         }
     }
     // TEMPORARY -- measures the period between successive loop entries, so a
     // stall is caught regardless of which call site blocked. See src/instrument.h
     INSTR_LOOPTICK();
+    gwRegTick();   // gateway registration state: call-change check (rate-limited to 1 s)
+#if INSTRUMENT_ENABLED
+    INSTR_ONRX_DRAIN();      // R1-F: emit queued [INS] ONRX records
+#endif
 
     // BP-01/BP-04: close a back-pressure episode with QRV once the TX ring
     // has drained, even when no further user message arrives to observe it.
@@ -2304,44 +3329,11 @@ void esp32loop()
         }
     #endif
 
-    #ifdef BOARD_LED
-        if(bUSER_BOARD_LED)
-        {
-            const uint32_t now = millis(); // millis() only once per cycle
-            const uint32_t flashDuration = 30;
-            const uint32_t interval =2000;  // Delay between flashes 2 sec.
-            if (!bLED)
-            {
-                if (now - led_timer >= interval) // repeats every 2 second, no cast needed for millis() as it is already uint32_t
-                {
-                    led_timer = now;
-                    bLED = true; // LED on 
-
-                    #ifdef LED_PIN
-                        if(pixels_delay == 0 && !bLED_CLEAR)
-                        {
-                            if(!bLED_RED && !bLED_GREEN && !bLED_ORANGE && !bLED_BLUE)
-                            {
-                                bLED_WEISS = true;
-                            }
-                        }
-                    #endif
-
-                        digitalWrite(BOARD_LED, HIGH ^ BOARD_LED_ACTIVE_LOW);
-                }
-            }
-            else
-            {
-                // if the LED is ON, we check the short Flash period of time (30ms)
-                if (now - led_timer >= flashDuration)
-                {
-                    bLED = false;
-                    // switch the board LED OFF
-                    digitalWrite(BOARD_LED, LOW ^ BOARD_LED_ACTIVE_LOW);
-                }
-            }
-        }
+    #if defined(REMOTE_LED_PIN)
+        remoteLedTick();   // RM "led flash": the pattern runs here, independent of --board led
     #endif
+
+    boardLedTick();   // --board led heartbeat (30 ms / 2 s); yields to RM hold and OneWire, no-op without an LED pin
 
     // D1-10: the shared scheduler runs at function scope, BEFORE the
     // BOARD_T5_EPAPER / if(bRadio) block below. Six of its seven jobs (battery,
@@ -2360,6 +3352,18 @@ void esp32loop()
 
     loopSchedulerRun(millis());
 
+    // WEB-RX-01: park counters, once per 5 minutes, only if the park was ever used
+    {
+        static uint32_t rxparkStatTimer = 0;
+        if((uint32_t)(millis() - rxparkStatTimer) >= (5 * 60 * 1000))
+        {
+            rxparkStatTimer = millis();
+            if(rxParkParked() > 0)
+                printfdeb("[RXPARK];parked;%lu;overflow;%lu;clamped;%lu\n", (unsigned long)rxParkParked(),
+                    (unsigned long)rxParkOverflow(), (unsigned long)rxParkClamped());
+        }
+    }
+
     // LoRa-Chip found
     #if defined(BOARD_T5_EPAPER)
         idf_loop();
@@ -2371,6 +3375,8 @@ void esp32loop()
     {
         if(bLORADEBUG && receiveFlag)
             printlndeb("receiveflag");
+
+        rxsTick();   // RX-silence snapshot (counters always, print under --loradebug)
 
         if(bLORADEBUG && transmittedFlag)
             printlndeb("transmittedFlag");
@@ -2406,18 +3412,12 @@ void esp32loop()
                     else if(ringBuffer[i][1] == RING_STATUS_READY) pending++;
                     else retrying++;
                 }
-                int w = iWrite;
-                int r = iRead;
-                // BP-02: queued is now the honest occupied-slot count (the
+                // BP-02: queued is the honest occupied-slot count (the
                 // pending/retrying/done buckets above already scan every
-                // slot and partition it exactly) instead of the raw index
-                // distance -- that distance counted freed holes left behind
-                // by a priority-starved entry parked at iRead as still
-                // queued (DJ8MEH-RCA: queued=19 vs. 3-4 real). The old
-                // arithmetic survives as `dist` below for anyone comparing
-                // against pre-BP-02 logs.
+                // slot and partition it exactly). TXP W1b (slot pool): the
+                // iW=/iR=/dist= fields are gone with the indices; retrying
+                // includes INFLIGHT and parked SENT slots.
                 int queued = pending + retrying + done;
-                int dist = (w >= r) ? (w - r) : (MAX_RING - r + w);
                 int dedup_used = 0;
                 for(int i = 0; i < MAX_DEDUP_RING; i++)
                 {
@@ -2426,9 +3426,9 @@ void esp32loop()
                         dedup_used++;
                 }
                 printfdeb("[MC-DBG] RING_STATUS queued=%d pending=%d retrying=%d "
-                              "done=%d iW=%d iR=%d dedup=%d/%d dist=%d\n",
-                              queued, pending, retrying, done, w, r,
-                              dedup_used, MAX_DEDUP_RING, dist);
+                              "done=%d dedup=%d/%d\n",
+                              queued, pending, retrying, done,
+                              dedup_used, MAX_DEDUP_RING);
             }
         }
 
@@ -2480,9 +3480,17 @@ void esp32loop()
                 struct setlogStatFields f;
                 setlogFillStat(&f, (uint32_t)ESP.getFreeHeap());
 
+                // OR-STAT: OnRxDone time distribution (drains the window)
+                {
+                    struct onrxStatsOut o;
+                    onrxStatsSnapshotReset(&o, ONRXDONE_WARN_MS);
+                    f.onrx_n = o.n; f.onrx_avg_ms = o.avg_ms; f.onrx_p95_ms = o.p95_ms;
+                    f.onrx_p99_ms = o.p99_ms; f.onrx_max_ms = o.max_ms; f.onrx_warn = o.warn;
+                }
+
                 if(bDisplayLog)
                 {
-                    char buf[300];
+                    char buf[400];
                     setlogFormatStat(buf, sizeof(buf), &f);
                     setlogPrint(buf);
                 }
@@ -2506,8 +3514,8 @@ void esp32loop()
                 {
                     uint32_t avg = stat_latency_sum[p] / stat_tx_count[p];
                     if(bLORADEBUG)
-                        printfdeb("[MC-PRIO] p%d_lat_avg=%ums p%d_lat_max=%dms p%d_cnt=%d\n",
-                            p, avg, p, stat_latency_max[p], p, stat_tx_count[p]);
+                        printfdeb("[MC-PRIO] p%d_lat_avg=%ums p%d_lat_max=%lums p%d_cnt=%d\n",
+                            p, avg, p, (unsigned long)stat_latency_max[p], p, stat_tx_count[p]);
                 }
             }
             // Reset window counters
@@ -2524,9 +3532,11 @@ void esp32loop()
             stat_hwm_timer = millis();
             if(!bDisplayLog)
             {
-                printfdeb("[MC-HWM] uptime=%lus queue_hwm=%d/%d csma_hwm=%d trickle=%lums\n",
+                printfdeb("[MC-HWM] uptime=%lus queue_hwm=%d/%d csma_hwm=%d trickle=%lums aged1=%lu aged2=%lu wait_hwm=%lu\n",
                     millis() / 1000, stat_queue_hwm, MAX_RING,
-                    stat_csma_hwm_attempts, trickle_interval_ms);
+                    stat_csma_hwm_attempts, trickle_interval_ms,
+                    (unsigned long)stat_csma_aged_boot[1], (unsigned long)stat_csma_aged_boot[2],
+                    (unsigned long)stat_wait_hwm_ms);
             }
         }
 
@@ -2653,6 +3663,11 @@ void esp32loop()
                         rx_irq_defer_count = 0;
                         iReceiveTimeOutTime=0;
 
+                        // RX-DEAF-01: no read is in flight here (the read path runs in this loop task
+                        // and clears the flag itself), so a set is_receiving is stale: clear it with
+                        // the radio restart, or the node stays deaf.
+                        is_receiving = false;
+
                         // FIX BUG #1: Call startReceive FIRST, then re-wire interrupts.
                         // Disable interrupt gating while we reconfigure
                         bEnableInterruptReceive = false;
@@ -2662,7 +3677,11 @@ void esp32loop()
                             digitalWrite(RADIO_CTRL, HIGH);  // RX Mode [OE1KBC]
                             delay(2);
                         #endif
+                        // Chip mode just before the restart (read-only; debug only)
+                        const char *rxs_mode_before = bLORADEBUG ? rxsChipModeName() : "na";
                         int state = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+                        g_rxs_restarts++;
+                        g_rxs.noteAction(RXS_BY_WATCHDOG, millis());
 
                         // Now re-wire the interrupt callback
                         radio.clearPacketReceivedAction();
@@ -2685,7 +3704,7 @@ void esp32loop()
                         if(bLORADEBUG)
                         {
                             printfdeb("[MC-SM] IDLE -> RX_LISTEN rc=%d\n", state);
-                            printfdeb("[MC-DBG] RX_RESTART src=timeout state=%d\n", state);
+                            printfdeb("[MC-DBG] RX_RESTART src=timeout state=%d mode_before=%s\n", state, rxs_mode_before);
                         }
 
                         if(bLORADEBUG)
@@ -2703,6 +3722,11 @@ void esp32loop()
                 }
             }
         }
+
+        // WEB-RX-01: packets parked while the web send buffer blocked the loop go first (oldest first),
+        // also when receiveFlag is not set.
+        if(rxParkCount() > 0)
+        { INSTR_SECTION("lora_rx"); LOOP_SECTION(LSEC_LORA_RX); loraRxParkDrain(); }
 
         if(receiveFlag || transmittedFlag)
         {
@@ -2839,9 +3863,9 @@ void esp32loop()
             // channel is free
             // nothing was detected
             // do not print anything, it just spams the console
-            int _w = iWrite;
-            int _r = iRead;
-            if (_w != _r)
+            // TXP W1b: "something sendable in the TX pool" (was iWrite != iRead); not
+            // txRingDepth() > 0: a parked own text waiting for its ACK is not sendable
+            if (getNextTxSlot() >= 0)
             {
                 // Debug E: TX_GATE_ENTER
                 // BP-02: qlen is txRingDepth() (occupied slots), not the raw
@@ -2864,7 +3888,9 @@ void esp32loop()
                     if(irqStatus & (RADIOLIB_SX126X_IRQ_HEADER_VALID |
                                     RADIOLIB_SX126X_IRQ_PREAMBLE_DETECTED))
                     {
-                        is_receiving = true;
+                        // RX-DEAF-01: the receive flag is not set here. irq_rx_active aborts the TX;
+                        // the flag is owned by the read path (checkRXRead() returns while it is set),
+                        // so setting it here kept every later read out until reboot.
                         irq_rx_active = true;
                         if(bLORADEBUG)
                             printfdeb("[MC-DBG] IRQ_POLL hdr/pre=0x%04X -> TX_ABORT\n",
@@ -2891,6 +3917,9 @@ void esp32loop()
                 #else
                 int cad_result = radio.scanChannel();
                 #endif
+                g_rxs.noteAction(RXS_BY_CAD, millis());
+                g_rxs_cad_scans++;
+                if(cad_result == RADIOLIB_LORA_DETECTED) g_rxs_cad_busy++;   // scan errors are not busy
                 if(bLORADEBUG)
                     printfdeb("[MC-DBG] CAD_SCAN result=%d\n", cad_result);
 
@@ -2909,6 +3938,9 @@ void esp32loop()
                         printfdeb("[CHECK] radio.scanChannel() / 2\n");
 
                     cad_result = radio.scanChannel();
+                    g_rxs.noteAction(RXS_BY_CAD, millis());
+                    g_rxs_cad_scans++;
+                    if(cad_result == RADIOLIB_LORA_DETECTED) g_rxs_cad_busy++;   // scan errors are not busy
                     if(bLORADEBUG)
                         printfdeb("[MC-DBG] CAD_SCAN result=%d\n", cad_result);
                     if(cad_result == RADIOLIB_CHANNEL_FREE)
@@ -2924,6 +3956,7 @@ void esp32loop()
                     if(bLORADEBUG)
                         printfdeb("[MC-DBG] CAD_FREE attempt=%d\n", cad_attempt);
 
+                    tx_cad_attempt = cad_attempt; // honest cad= in the TX log (csma_reset zeroes it)
                     csma_reset();
 
                     // set Transmit Interrupt
@@ -2937,6 +3970,7 @@ void esp32loop()
                     if(doTX())
                     {
                         ch_util_tx_start = millis();
+                        g_rxs.noteAction(RXS_BY_TX, ch_util_tx_start);
                         // Debug F: TX_START
                         // BP-02: qlen is txRingDepth() (occupied slots), not
                         // the raw index distance -- see txRingDepth() doc.
@@ -2974,7 +4008,7 @@ void esp32loop()
                 {
                     // Channel busy confirmed — backoff
                     cad_attempt++;
-                    csma_timeout = csma_compute_timeout(cad_attempt);
+                    csma_timeout = csma_compute_timeout_nofloor(cad_attempt); // CAD_BUSY: no age floor
 
                     if(bLORADEBUG)
                     {
@@ -3005,6 +4039,11 @@ void esp32loop()
     } // bRadio active
 
     #endif
+
+    // RM-05 (#1189): authenticated remote-management DMs queued by OnRxDone; crypto, execution,
+    // flash write and the reply run here, in the loop task. Outside the T5 / local-radio #if above
+    // on purpose: every board (and the external-radio path) feeds the same queue.
+    rmDrain();
 
     // get RTC Now
     // RTC hat Vorrang zu Zeit via MeshCom-Server
@@ -3193,8 +4232,21 @@ void esp32loop()
         #if defined(GPS_SWITCH)
             digitalWrite(GPS_SWITCH, LOW);
         #endif
+        #if defined(BOARD_HELTEC_V4)
+            // GPSV4-01: GPS off -> GNSS enable driven inactive once, not left floating. This branch runs every
+            // loop pass, so a latch keeps it to one call per boot (a later --gps off deactivates by itself).
+            static bool s_hv4GpsOffApplied = false;
+            if(!s_hv4GpsOffApplied)
+            {
+                WZ_GPS_Deactivate();
+                s_hv4GpsOffApplied = true;
+            }
+        #endif
     }
     #endif
+
+    // AU-05 (#1187): firmware auto update tick (self-gated to once per second)
+    auTick();
 
     // check WiFI connected with Ping every 30 sec
     if(meshcom_settings.node_netmode == 0 && (uint32_t)(millis() - wifi_active_timer) >= 30000)
@@ -3301,11 +4353,14 @@ void esp32loop()
     {
     	g_ble_uart_is_connected = true;
 
-        // Disconnect if app-layer auth failed
-        if(ble_disconnect_requested)
+        // Disconnect if app-layer auth failed. AU-10: pServer is NULL and the stack stopped while
+        // an update job has BLE paused; the request stays pending until the lock is free.
+        if(ble_disconnect_requested && bleLifeLock())
         {
             ble_disconnect_requested = false;
-            pServer->disconnect(g_ble_conn_handle);
+            if(pServer != NULL)
+                pServer->disconnect(g_ble_conn_handle);
+            bleLifeUnlock();
         }
 	}
 
@@ -3355,10 +4410,33 @@ void esp32loop()
         if((uint32_t)(millis() - s_bleAdvChk) >= 5000UL)
         {
             s_bleAdvChk = millis();
+
+            // AU-10: a resume that failed after an update job is retried here (30 s apart, 5 times;
+            // blocks the loop for the NimBLE bring-up, about a second). Not while the job runs:
+            // it retries itself three times.
+            static uint32_t s_bleRetryMs = 0;
+            static uint8_t s_bleRetries = 0;
+            if(s_bleDown && s_bleResumeFailed && !s_bleGuard && s_bleRetries < 5 &&
+               (uint32_t)(millis() - s_bleRetryMs) >= 30000UL)
+            {
+                FwNetStatus _fst;
+                fwNetGetStatus(_fst);
+                if(_fst.state != FWS_BUSY)
+                {
+                    s_bleRetryMs = millis();
+                    s_bleRetries++;
+                    esp32BleResume();
+                }
+            }
+            if(!s_bleDown)
+                s_bleRetries = 0;
+
+            // AU-10: the lock fails while BLE is paused or being resumed (and pServer is NULL then)
             if(!deviceConnected && pServer != NULL && pService != NULL
                #if defined(BENCH_BLE_ADV_LATE)
                && s_bootReadyLogged
                #endif
+               && bleLifeLock()   // last: it takes the lock, the body releases it
               )
             {
                 NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
@@ -3369,6 +4447,7 @@ void esp32loop()
                     if(bBLEDEBUG)
                         Serial.printf("[BLE ];adv_restart;ms;%lu;ok;%d\n", (unsigned long)millis(), (int)ok);
                 }
+                bleLifeUnlock();
             }
         }
 
@@ -3516,9 +4595,8 @@ void esp32loop()
             
         if(!bGPSON)
         {
-            #if defined (BOARD_T_DECK_PRO)
-            tdeck_set_gps(false);
-            #endif
+            // T-Deck Pro: no loop-side suspend of gps_task. bGPSON is forced false at boot, so this ran
+            // every 3 s and froze GPS screen 3 (GPS-SKY W4). entry3/exit3 start and stop the task.
 
             if(meshcom_settings.node_postime > 0)
             {
@@ -3814,7 +4892,7 @@ void esp32loop()
     unsigned long akt_timer = meshcom_settings.node_parm_time;
     if(akt_timer < 5 || akt_timer > 120)
     {
-        akt_timer = TELEMETRY_INTERVAL;
+        akt_timer = 15;   // default 15 minutes (TELEMETRY_INTERVAL is 30*60 and read as minutes = 30 h)
     }
     
     akt_timer = akt_timer * 1000 * 60; // convert to minutes
@@ -3829,13 +4907,13 @@ void esp32loop()
         bTeleFirst=false;
 
         // APP-ID , Header only flag
-        sendTelemetry(SOFTSER_APP_ID);
+        sendTelemetry(telemetryAppId(bSOFTSERON, SOFTSER_APP_ID));
 
         telemetry_timer = millis();
     }
 
-    if(meshcom_settings.node_pingcall[0] == 0x00 || meshcom_settings.node_pingtime == 0 || meshcom_settings.node_pingcount == 0)
-        { INSTR_SECTION("display_tick"); LOOP_SECTION(LSEC_DISPLAY); mainStartTimeLoop(); }
+    // CLK-PING-01: clock tick always; the clock line skips itself while a held frame is shown.
+    { INSTR_SECTION("display_tick"); LOOP_SECTION(LSEC_DISPLAY); mainStartTimeLoop(); }
 
     #if not defined(BOARD_T_DECK_PRO)
     if(DisplayOffWait > 0)
@@ -3851,8 +4929,7 @@ void esp32loop()
                 digitalWrite(PIN_TFT_LEDA_CTL, HIGH);   // TFT OFF
                 #endif
 
-                if(meshcom_settings.node_pingcall[0] == 0x00 || meshcom_settings.node_pingtime == 0 || meshcom_settings.node_pingcount == 0)
-                    sendDisplay1306(true, true, 0, 0, (char*)"#C");
+                sendDisplay1306(true, true, 0, 0, (char*)"#C");
             }
         }
     }
@@ -3974,6 +5051,53 @@ void esp32loop()
     }
     #endif
 
+    // WX-01: UV sample on its own 60 s gate, wind on its own 1 s gate (both non-blocking)
+    #if defined(ENABLE_LTR390)
+    {
+        static unsigned long uvTimeWait = 0;
+        if(bUVON && ltr390_found && (uint32_t)(millis() - uvTimeWait) >= 60000)
+        {
+            uvTimeWait = millis();
+            uint32_t uvRaw = 0;
+            float uvi = 0.0f;
+            if(ltr390Read(&uvRaw, &uvi))
+            {
+                wx_uv_raw = uvRaw;
+                wx_uv_last = uvi;
+                wxMeanAdd(&wx_uv_mean, uvi);
+            }
+        }
+    }
+    #endif
+    #if defined(ENABLE_WIND)
+    {
+        static unsigned long windTimeWait = 0;
+        if(bWINDON && windActive())
+        {
+            unsigned long nowMs = millis();
+            if(windTimeWait == 0)
+            {
+                windTimeWait = nowMs;   // first pass after (re)start: open the window, drop what was counted before
+                (void)windTakePulses();
+            }
+            else if((uint32_t)(nowMs - windTimeWait) >= 1000)
+            {
+                float seconds = (float)((uint32_t)(nowMs - windTimeWait)) / 1000.0f;
+                windTimeWait = nowMs;
+                uint32_t pulses = windTakePulses();
+                float kmh = windKmh(pulses, seconds, meshcom_settings.node_wind_cal);
+                wx_wind_last_kmh = kmh;
+                wxMeanAdd(&wx_wind_mean, kmh);
+                wxGustAdd(&wx_wind_gust, kmh);
+                if(bWXDEBUG)
+                    windDebugLog(pulses, seconds, meshcom_settings.node_wind_cal);
+            }
+        }
+        else
+            windTimeWait = 0;
+    }
+    #endif
+
     // read BMP Sensor
     #if defined(ENABLE_BMX280) || defined(ENABLE_AHT20) || defined(ENABLE_SHT21)
     if(((bBMPON || bBMEON) && bmx_found) || (bAHT20ON && aht20_found) || (bSHT21ON && sht21_found))
@@ -4086,7 +5210,7 @@ void esp32loop()
     // others off that block is never entered, so kissStop() would be unreachable
     // and "--kiss off" could not close the (unauthenticated) listener.
     #ifndef DISABLE_KISS_TCP
-    if(bKISS)
+    if(bKISS && (s_auShedMask & FW_SHED_KISS) == 0)   // s_auShedMask: update job shedding (spec 8.1), restored by clearing it
     {
         flushKissQueue();
         kissLoop();   // self-guarding on WiFi.status(); opens the socket once WiFi is up
@@ -4095,6 +5219,15 @@ void esp32loop()
     {
         kissStop();
     }
+    #endif
+
+    // Net console stop, same reason as KISS above: with the console as the only
+    // service the block below is skipped after "--netconsole off", and the
+    // listener stayed open (P-0169). Stopping needs no network, so no
+    // iWlanWait gate either.
+    #ifndef DISABLE_NET_CONSOLE
+    if(!bNETCONSOLE || (s_auShedMask & FW_SHED_CONSOLE) != 0)
+        stopNetConsole();   // no-op unless started
     #endif
 
     if(bWEBSERVER || bEXTUDP || bGATEWAY || bNETCONSOLE || bKISS)
@@ -4162,17 +5295,10 @@ void esp32loop()
         }
 
         #ifndef DISABLE_NET_CONSOLE
-        if(iWlanWait == 0)
+        if(bNETCONSOLE && iWlanWait == 0 && (s_auShedMask & FW_SHED_CONSOLE) == 0)
         {
-            if(bNETCONSOLE)
-            {
-                startNetConsole();
-                loopNetConsole();
-            }
-            else
-            {
-                stopNetConsole();
-            }
+            startNetConsole();
+            loopNetConsole();
         }
         #endif
 
@@ -4191,6 +5317,11 @@ void esp32loop()
         }
     }
 
+    heapMarksPoll();   // [HEAP] boot marks, each once per boot
+    #if defined(HAS_TFT)
+    tftSpriteReconcile();
+    #endif
+
     if (resendPing == 0)
         resendPing = millis();
 
@@ -4208,13 +5339,16 @@ void esp32loop()
 
             PingResult pingResult = sendPing(meshcom_settings.node_pingcall);
 
-            printfdeb("[PING]...%s Ping to %s <%i>\n", (pingResult == PING_QUEUED) ? "send" : "FAILED", meshcom_settings.node_pingcall, meshcom_settings.node_pingcount);
+            // PING_INVALID_TARGET logs its own once-per-episode notice in sendPing().
+            if(pingResult != PING_INVALID_TARGET)
+                printfdeb("[PING]...%s Ping to %s <%i>\n", (pingResult == PING_QUEUED) ? "send" : "FAILED", meshcom_settings.node_pingcall, meshcom_settings.node_pingcount);
 
             // TRACK ist ein statischer Zustand: würde man das Budget trotzdem verbrauchen,
             // liefe es in N x pingtime Sekunden auf null, ohne dass je etwas gesendet wurde,
             // und der Knoten verstummt dauerhaft -- wirkt dann wie ein Einstellungsfehler.
             // Ein abgelehnter Ring ist dagegen ein echter Sendeversuch und zählt mit.
-            if(pingResult != PING_SUPPRESSED_TRACK)
+            // PING_INVALID_TARGET is no send attempt either.
+            if(pingResult != PING_SUPPRESSED_TRACK && pingResult != PING_INVALID_TARGET)
                 meshcom_settings.node_pingcount--;
         }
     }
@@ -4226,6 +5360,9 @@ void esp32loop()
         // printfdeb("Loop: Timeout reached. Timer: %lu, Millis: %lu\n", tdeck_tft_timer, millis());
         tft_off();
     }
+
+    // TD-23: day/night backlight check and the debounced SYM+B save
+    brightnessTick(false);
 
     { INSTR_SECTION("lvgl"); LOOP_SECTION(LSEC_LVGL); lv_task_handler(); }
 
@@ -4273,26 +5410,41 @@ void esp32loop()
 }
 
 
-int checkRX(bool bRadio)
+// WEB-RX-01 (#1229): checkRX() is split in a READ half (chip -> RxCtx, RX restart) and a PROCESS
+// half (accounting, logs, OnRxDone). The web send buffer's wait path may run the READ half via
+// loraRxParkService() and park the packet; the loop drains it through the PROCESS half.
+struct RxCtx
 {
-    int state = -1;
+    uint8_t payload[UDP_TX_BUF_SIZE+10];
+    size_t  ibytes;
+    int     state;
+    int     rssi;       // saved before the RX restart
+    int     snr;
+    float   ferr;       // not carried through the park (0.0 for parked packets)
+    bool    rxs_noted = false;  // RX-silence event already noted at read time (parked packet)
+};
 
-    //#if not defined(BOARD_T_DECK_PRO)
-    // extra source
-    // you can receive data as an Arduino String
-    // NOTE: receive() is a blocking method!
-    //       See example ReceiveInterrupt for details
-    //       on non-blocking reception method.
+// RX-silence event for a read packet; rssi/snr only for a received frame, like nRF52
+// (CRC and read errors report na).
+static void rxsNoteRxCtx(const RxCtx &c)
+{
+    rxsNoteEvent(c.ibytes > 0 && (c.state == RADIOLIB_ERR_LORA_HEADER_DAMAGED || c.state == RADIOLIB_ERR_NONE),
+                 c.rssi, c.snr);
+}
 
-    if(!bRadio)
-        return -1;
-        
+// READ half. Returns false when a read is already in action (is_receiving). On true the caller owns
+// is_receiving and must clear it after the process half / park push.
+static bool checkRXRead(RxCtx &c)
+{
     if(is_receiving)    // receive in action
-        return -1;
+        return false;
 
     is_receiving=true;
 
-    uint8_t payload[UDP_TX_BUF_SIZE+10];
+    c.ibytes = 0;
+    c.rssi = 0;
+    c.snr = 0;
+    c.ferr = 0.0f;
 
     // Die echte Paketlaenge muss VOR readData() vom Chip gelesen werden.
     // RadioLib nimmt `len` per WERT und schreibt die tatsaechliche Laenge NICHT
@@ -4315,16 +5467,22 @@ int checkRX(bool bRadio)
     if(ibytes > UDP_TX_BUF_SIZE)
         ibytes = UDP_TX_BUF_SIZE;
 
-    state = radio.readData(payload, ibytes);
+    c.ibytes = ibytes;
+
+    int state = radio.readData(c.payload, ibytes);
+    c.state = state;
+#if INSTRUMENT_ENABLED
+    INSTR_IRQ_READ();        // R1-F: irq_to_read_us, consumed by OnRxDone
+#endif
 
     if (state == RADIOLIB_ERR_LORA_HEADER_DAMAGED || state == RADIOLIB_ERR_NONE)
     {
         // FIX BUG #2: Save RSSI/SNR/FreqError BEFORE restarting RX.
         // These read from SX1262 hardware registers via SPI and would be
         // invalidated once startReceive() transitions the radio to standby+RX.
-        int saved_rssi = (int)radio.getRSSI();
-        int saved_snr  = (int)radio.getSNR();
-        float   saved_ferr = radio.getFrequencyError();
+        c.rssi = (int)radio.getRSSI();
+        c.snr  = (int)radio.getSNR();
+        c.ferr = radio.getFrequencyError();
 
         // FIX BUG #2: Restart RX immediately after reading FIFO, BEFORE processing.
         // The packet data is already in our local payload buffer.
@@ -4352,6 +5510,74 @@ int checkRX(bool bRadio)
             if(bLORADEBUG)
                 printfdeb("[MC-DBG] RX_RESTARTED src=after_readData state=%d\n", rxstate);
         }
+    }
+    else
+    if (state == RADIOLIB_ERR_CRC_MISMATCH)
+    {
+        // RSSI/SNR/FreqError VOR RX-Restart sichern (Register werden ungueltig)
+        c.rssi = (int16_t)radio.getRSSI();
+        c.snr  = (int8_t)radio.getSNR();
+        c.ferr = radio.getFrequencyError();
+
+        // RX sofort wieder starten
+        {
+            radio.clearPacketReceivedAction();
+            radio.clearPacketSentAction();
+            bEnableInterruptReceive = true;
+            radio.setPacketReceivedAction(setFlagReceive);
+            #ifdef RADIO_CTRL
+                digitalWrite(RADIO_CTRL, HIGH);  // RX Mode [OE1KBC]
+                delay(2);
+            #endif
+            int rxstate = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+
+            if(bLORADEBUG)
+                printfdeb("[MC-DBG] RX_RESTARTED src=after_crc_error state=%d\n", rxstate);
+        }
+    }
+    else
+    {
+        // RX-Restart auch bei unbekannten Fehlern -- ohne dies bleibt
+        // das Radio im Standby (BLINDSPOT fuer Empfang!)
+        c.rssi = (int16_t)radio.getRSSI();
+        c.snr  = (int8_t)radio.getSNR();
+
+        {
+            radio.clearPacketReceivedAction();
+            radio.clearPacketSentAction();
+            bEnableInterruptReceive = true;
+            radio.setPacketReceivedAction(setFlagReceive);
+            #ifdef RADIO_CTRL
+                digitalWrite(RADIO_CTRL, HIGH);  // RX Mode [OE1KBC]
+                delay(2);
+            #endif
+            int rxstate = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+
+            if(bLORADEBUG)
+                printfdeb("[MC-DBG] RX_RESTARTED src=after_other_error state=%d\n", rxstate);
+        }
+    }
+
+    return true;
+}
+
+// PROCESS half: everything after the RX restart. Runs in the loop task only (direct or drained).
+static void checkRXProcess(RxCtx &c)
+{
+    uint8_t *payload = c.payload;
+    size_t ibytes = c.ibytes;
+    int state = c.state;
+
+    // Every frame that reached the PROCESS half is an RX event. A parked frame was already
+    // noted when loraRxParkService() read it.
+    if(!c.rxs_noted)
+        rxsNoteRxCtx(c);
+
+    if (state == RADIOLIB_ERR_LORA_HEADER_DAMAGED || state == RADIOLIB_ERR_NONE)
+    {
+        int saved_rssi = c.rssi;
+        int saved_snr  = c.snr;
+        float saved_ferr = c.ferr;
 
         if(bLORADEBUG)
         {
@@ -4383,7 +5609,12 @@ int checkRX(bool bRadio)
             OnRxDone(payload, (uint16_t)ibytes, saved_rssi, saved_snr);
         }
         else
-        if(bLORADEBUG)
+        {
+#if INSTRUMENT_ENABLED
+            INSTR_IRQ_DROP();   // R1-F: frame read, OnRxDone not reached
+#endif
+        }
+        if(ibytes == 0 && bLORADEBUG)
         {
             // Laenge 0 heisst: der Chip hat nichts im Puffer. Frueher lief das
             // als 255-Byte-Frame aus uninitialisiertem Stack weiter.
@@ -4393,29 +5624,15 @@ int checkRX(bool bRadio)
     else
     if (state == RADIOLIB_ERR_CRC_MISMATCH)
     {
+#if INSTRUMENT_ENABLED
+        INSTR_IRQ_DROP();       // R1-F: frame read, OnRxDone not reached
+#endif
         if(bLORADEBUG)
             printfdeb("OnRxError\n");
 
-        // RSSI/SNR/FreqError VOR RX-Restart sichern (Register werden ungueltig)
-        int16_t saved_crc_rssi = (int16_t)radio.getRSSI();
-        int8_t  saved_crc_snr  = (int8_t)radio.getSNR();
-        float   saved_crc_ferr = radio.getFrequencyError();
-
-        // RX sofort wieder starten
-        {
-            radio.clearPacketReceivedAction();
-            radio.clearPacketSentAction();
-            bEnableInterruptReceive = true;
-            radio.setPacketReceivedAction(setFlagReceive);
-            #ifdef RADIO_CTRL
-                digitalWrite(RADIO_CTRL, HIGH);  // RX Mode [OE1KBC]
-                delay(2);
-            #endif
-            int rxstate = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
-
-            if(bLORADEBUG)
-                printfdeb("[MC-DBG] RX_RESTARTED src=after_crc_error state=%d\n", rxstate);
-        }
+        int16_t saved_crc_rssi = (int16_t)c.rssi;
+        int8_t  saved_crc_snr  = (int8_t)c.snr;
+        float   saved_crc_ferr = c.ferr;
 
         // RX channel utilization: CRC-failed packet still occupied the channel
         ch_util_rx_accum.fetch_add(radio.getTimeOnAir(ibytes) / 1000);  // us -> ms
@@ -4449,28 +5666,14 @@ int checkRX(bool bRadio)
     }
     else
     {
+#if INSTRUMENT_ENABLED
+        INSTR_IRQ_DROP();       // R1-F: read error, OnRxDone not reached
+#endif
         if(bLORADEBUG)
             printfdeb("OnRxError\n");
 
-        // RX-Restart auch bei unbekannten Fehlern -- ohne dies bleibt
-        // das Radio im Standby (BLINDSPOT fuer Empfang!)
-        int16_t saved_err_rssi = (int16_t)radio.getRSSI();
-        int8_t  saved_err_snr  = (int8_t)radio.getSNR();
-
-        {
-            radio.clearPacketReceivedAction();
-            radio.clearPacketSentAction();
-            bEnableInterruptReceive = true;
-            radio.setPacketReceivedAction(setFlagReceive);
-            #ifdef RADIO_CTRL
-                digitalWrite(RADIO_CTRL, HIGH);  // RX Mode [OE1KBC]
-                delay(2);
-            #endif
-            int rxstate = radio.startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED), RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
-
-            if(bLORADEBUG)
-                printfdeb("[MC-DBG] RX_RESTARTED src=after_other_error state=%d\n", rxstate);
-        }
+        int16_t saved_err_rssi = (int16_t)c.rssi;
+        int8_t  saved_err_snr  = (int8_t)c.snr;
 
         // Immer loggen (nicht nur bLORADEBUG) -- unbekannte Fehler sind kritisch
         printfdeb("[MC-DBG] RX_OTHER_ERROR code=%d rssi=%d snr=%d size=%d ts=%lu\n",
@@ -4486,12 +5689,99 @@ int checkRX(bool bRadio)
             printfdeb("\n");   // F2: printfdeb appends no line end
         }
     }
+}
+
+int checkRX(bool bRadio)
+{
+    //#if not defined(BOARD_T_DECK_PRO)
+    // extra source
+    // you can receive data as an Arduino String
+    // NOTE: receive() is a blocking method!
+    //       See example ReceiveInterrupt for details
+    //       on non-blocking reception method.
+
+    if(!bRadio)
+        return -1;
+
+    RxCtx c;
+    if(!checkRXRead(c))
+        return -1;
+
+    checkRXProcess(c);
 
     //#endif
 
     is_receiving=false;
 
-    return state;
+    return c.state;
+}
+
+#if !defined(BOARD_T5_EPAPER)
+// WEB-RX-01: drain parked packets (oldest first) through the PROCESS half. Loop task only.
+// noinline: keeps the RxCtx payload (~265 B) out of the esp32loop() frame, the root of the deepest
+// loop-task call chains (advisor note, WEB-RX-01 W2)
+__attribute__((noinline)) static void loraRxParkDrain(void)
+{
+    while(rxParkCount() > 0)
+    {
+        RxCtx c;
+        size_t len = 0;
+        int16_t rssi = 0;
+        int8_t snr = 0;
+        int st = 0;
+        if(!rxParkPop(c.payload, &len, &rssi, &snr, &st))
+            break;
+        c.ibytes = len;
+        c.state = st;
+        c.rssi = rssi;
+        c.snr = snr;
+        c.ferr = 0.0f;
+        c.rxs_noted = true;     // Noted in loraRxParkService() at read time
+
+        // same exclusion as the flag path: no hook read while a packet is being processed
+        is_receiving = true;
+        checkRXProcess(c);
+        is_receiving = false;
+
+        inoReceiveTimeOutTime = millis();
+        iReceiveTimeOutTime = millis();
+        csma_timeout = csma_compute_timeout(cad_attempt);
+    }
+}
+#endif
+
+// WEB-RX-01: called from the web send buffer's wait path (txFeed). Reads a pending packet off the
+// chip and parks it; never processes (no OnRxDone). CRC/header-error/other branches are counted
+// and logged exactly once, in checkRXProcess() when the packet is drained.
+void loraRxParkService(void)
+{
+#if !defined(BOARD_T5_EPAPER)
+    if(!bRadio)
+        return;
+
+    // TX running: bEnableInterruptTransmit is set before doTX() until TX done (or TX watchdog),
+    // tx_is_active covers the lora_functions TX path, transmittedFlag a finished-but-unhandled TX.
+    bool txBusy = bEnableInterruptTransmit || tx_is_active || transmittedFlag;
+
+    if(!rxParkShouldService(receiveFlag, is_receiving, txBusy, rxParkCount() >= RX_PARK_SLOTS))
+        return;
+
+    // clear flags the same way the loop does before checkRX()
+    bEnableInterruptReceive = false;
+    receiveFlag = false;
+    rx_irq_defer_count = 0;
+
+    RxCtx c;
+    if(!checkRXRead(c))     // sets is_receiving
+        return;
+
+    // The RX event happened now, not when the loop drains the park later (a late note would
+    // credit the end of a silence to the RX restart that runs before the drain, and stretch dur=)
+    rxsNoteRxCtx(c);
+
+    rxParkPush(c.payload, c.ibytes, (int16_t)c.rssi, (int8_t)c.snr, c.state);
+    is_receiving = false;
+#endif
 }
 
 

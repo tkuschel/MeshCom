@@ -4,6 +4,7 @@
 // src/nrf52/loop_actions_nrf52.cpp.
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <configuration.h>
 #include "loop_scheduler.h"
 #include "loop_functions.h"
@@ -11,6 +12,8 @@
 #include "batt_functions.h"
 #include "batt_pipeline.h"
 #include "lora_functions.h"
+#define CET_AGE_WITH_CLOCK
+#include "cet_age.h"
 #include "txring_functions.h"
 #include "command_functions.h"
 #if defined(ENABLE_MSGSTORE)
@@ -68,7 +71,7 @@ void loopAction_retransmit(void)
     // BP-03 (DJ8MEH-RCA): age out stale BACKGROUND (HEY) ring
     // entries here, in the main-loop tick -- NOT in getNextTxSlot(),
     // which also runs on the nRF52 timer task (Advisor F1).
-    txRingAgeBackground(millis());
+    txRingAgeBackground(millis(), cetDeviceClock());
 }
 
 // ---- mcp_refresh_timer -------------------------------------------------
@@ -99,6 +102,91 @@ bool loopEnabled_heapMon(void)
         heapMonTimer = millis();
 
     return on;
+}
+
+// ---- [HEAP] boot marks (heap verdict 2026-10-18, 6.5) ------------------------
+// One line per service, once per boot, in the format of the (init) line, so a heap drop is
+// attributable from a single boot log. Unlike (init) they print under --setlog on as well
+// (bench and field nodes run setlog); one short line each. The services come up in different
+// places (setup, loop), so heapMarksPoll() runs once per loop pass after the service block and
+// prints each mark the first time its service is up. Anchors:
+//   wifi  WiFi.status()==WL_CONNECTED          udp  hasIPaddress (set by startMeshComUDP())
+//   web   bweb_server_running                  mdns web up and MDNS.begin() did not fail (bMDNSOK)
+//   kiss  bKISS and the link is up (kissLoop() has opened the listener in this pass)
+//   netconsole  bNETCONSOLE and iWlanWait==0 (startNetConsole()/loopNetConsole() ran this pass)
+//   ble   heapMarkBle(), called right after the boot bleStackStart()
+//   tft   heapMarkTft() (HAS_TFT), called right after the boot initTFT()
+extern bool bweb_server_running;   // web_functions.cpp
+extern bool bMDNSOK;               // web_functions.cpp
+extern bool hasIPaddress;          // udp_functions.cpp
+
+static uint8_t s_heapMarksDone = 0;
+#define HM_WIFI 0x01
+#define HM_WEB 0x02
+#define HM_MDNS 0x04
+#define HM_UDP 0x08
+#define HM_KISS 0x10
+#define HM_NETCON 0x20
+#define HM_BLE 0x40
+#define HM_TFT 0x80
+
+#define HEAP_MARK(bit, label)                                                              \
+    do                                                                                     \
+    {                                                                                      \
+        s_heapMarksDone |= (bit);                                                          \
+        printfdeb("[HEAP];%s;%lu;%d;%d;(" label ")\n", getTimeString().c_str(),            \
+                  (unsigned long)ESP.getFreeHeap(), (int)ESP.getMinFreeHeap(),             \
+                  (int)ESP.getMaxAllocHeap());                                             \
+    } while (0)
+
+void heapMarkBle(void)
+{
+    if (!(s_heapMarksDone & HM_BLE))
+        HEAP_MARK(HM_BLE, "ble");
+}
+
+void heapMarkTft(void)
+{
+    if (!(s_heapMarksDone & HM_TFT))
+        HEAP_MARK(HM_TFT, "tft");
+}
+
+void heapMarksPoll(void)
+{
+    // HM_BLE is set by heapMarkBle() (BLE start), not by this poll.
+    const uint8_t pollBits = HM_WIFI | HM_WEB | HM_MDNS | HM_UDP | HM_KISS | HM_NETCON;
+    if ((s_heapMarksDone & pollBits) == pollBits)
+        return;
+
+    // Boot window over: services that are disabled or absent never reach their mark. Declare
+    // them done (no line printed) so the poll stops instead of running every loop forever.
+    if (millis() >= 120000UL)
+    {
+        s_heapMarksDone |= pollBits;
+        return;
+    }
+
+    const bool wifiUp = (WiFi.status() == WL_CONNECTED);
+    if (wifiUp && !(s_heapMarksDone & HM_WIFI))
+        HEAP_MARK(HM_WIFI, "wifi");
+    if (wifiUp && hasIPaddress && !(s_heapMarksDone & HM_UDP))
+        HEAP_MARK(HM_UDP, "udp");
+    if (bweb_server_running && !(s_heapMarksDone & HM_WEB))
+        HEAP_MARK(HM_WEB, "web");
+    if (bweb_server_running && bMDNSOK && !(s_heapMarksDone & HM_MDNS))
+        HEAP_MARK(HM_MDNS, "mdns");
+#ifndef DISABLE_KISS_TCP
+    if (bKISS && wifiUp && !(s_heapMarksDone & HM_KISS))
+        HEAP_MARK(HM_KISS, "kiss");
+#else
+    s_heapMarksDone |= HM_KISS;
+#endif
+#ifndef DISABLE_NET_CONSOLE
+    if (bNETCONSOLE && iWlanWait == 0 && !(s_heapMarksDone & HM_NETCON))
+        HEAP_MARK(HM_NETCON, "netconsole");
+#else
+    s_heapMarksDone |= HM_NETCON;
+#endif
 }
 
 void loopAction_heapMon(void)
@@ -244,6 +332,25 @@ void loopAction_battCheck(void)
         if(PMU != NULL)
         {
             const float pmu_mv = (float)PMU->getBattVoltage();
+
+            // BAT-04: charge state (+ net current on the AXP192 only), one store.
+            BattChargeInfo bci = { BCS_UNKNOWN, false, 0 };
+            bci.state = battChargeClassify(PMU->isVbusIn(), PMU->isBatteryConnect(), PMU->isCharging());
+            if(PMU->getChipModel() == XPOWERS_AXP192)
+            {
+                // AXP2101 has no battery current ADC: ma stays invalid there.
+                XPowersAXP192 *axp = static_cast<XPowersAXP192 *>(PMU);
+                const float chg_ma = axp->getBatteryChargeCurrent();
+                const float dis_ma = axp->getBattDischargeCurrent();
+                // 13-bit ADC x 0.5 mA tops out at 4095.5 mA; a failed I2C read returns 0xFFFF
+                // (32767.5 mA), which must not show up as a measurement.
+                if(chg_ma <= 4095.5f && dis_ma <= 4095.5f)
+                {
+                    bci.ma = battNetMa(chg_ma, dis_ma);
+                    bci.ma_valid = true;
+                }
+            }
+            global_batt_charge = bci;
             pmu_proz = (int)PMU->getBatteryPercent();   // only the "no battery" verdict, see below
 
             // no BATT
@@ -271,6 +378,7 @@ void loopAction_battCheck(void)
         {
             global_batt = 0;
             global_proz = 0;
+            global_batt_charge = { BCS_UNKNOWN, false, 0 };
 
             // Ohne PMU gibt es keine Messung. Ohne diese Zeile wuerde
             // PositionToAPRS() jetzt dauerhaft "/B=000" senden und damit
@@ -285,7 +393,10 @@ void loopAction_battCheck(void)
         if(bDisplayCont && (uint32_t)(millis() - s_lastPmuPrint) >= 10000UL)
         {
             s_lastPmuPrint = millis();
-            printfdeb("[readBatteryVoltage]...PMU.volt %.1f PMU.proz %i %i\n", global_batt, global_proz, pmu_proz);
+            char chgtxt[40];
+            const BattChargeInfo chg_snap = global_batt_charge;
+            battChargeFormat(chgtxt, sizeof(chgtxt), chg_snap);
+            printfdeb("[readBatteryVoltage]...PMU.volt %.1f PMU.proz %i %i %s\n", global_batt, global_proz, pmu_proz, chgtxt);
         }
     #else
 

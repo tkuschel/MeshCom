@@ -109,23 +109,36 @@ size_t fieldCount();
     /* one-shot "wipe at next boot" trigger (config_json.h:131-132); NVS key  \
      * is "node_cflash", member is node_cleanflash. */                       \
     X("node_cflash",    CFG_INT, node_cleanflash, CFG_NORANGE, CFG_NOESC)                        \
+    /* gateway registration state (gw_reg_runtime.cpp): persisted, never exported/imported. */   \
+    X("node_gwrf",      CFG_INT, node_gwrf,       CFG_NORANGE, CFG_NOESC)                        \
+    /* SENS-04: one-wire DHT type (11 or 22), --dht; persisted, not exported. */                  \
+    X("node_dht",       CFG_INT, node_dht_type,   11.0, 22.0, CFG_NOESC)                         \
+    X("node_gwrc",      CFG_STR, node_gwrc,       CFG_NORANGE, CFG_NOESC)                        \
     SETTINGS_PERSIST_ONLY_LIST_PLATFORM(X)
 
 /* Platform-only persisted-but-not-exported fields: the 13 T-Deck device
  * UI/behaviour rows from the triage's S4(b) list that are NOT already
- * covered by the 4 "both platforms" rows above. These 13 struct members
+ * covered by the 4 "both platforms" rows above, plus TD-23's three
+ * backlight rows (node_blday/node_blnight/node_blauto). These 16 struct members
  * exist ONLY when BOARD_T_DECK / BOARD_T_DECK_PLUS / BOARD_T_DECK_PRO is
  * defined (src/esp32/esp32_flash.h's own `#if` guard) -- narrower than plain
  * `#ifdef ESP32`, unlike CFG_FIELD_LIST_PLATFORM's ESP32 block (node_disp_rot
  * and the spectrum-scan fields, which have no such further guard and exist
  * on every ESP32 board). node_audio_start/node_audio_msg are CFG_STR rows
- * here (not CFG_FIELD_LIST) for the same reason the other 11 T-Deck fields
+ * here (not CFG_FIELD_LIST) for the same reason the other 14 T-Deck fields
  * are: T-Deck-only device UI state, not portable configuration -- see the
  * file header comment above for why they could not be schema rows before
  * D1-04 W3 Task 2's char[] conversion. */
 #ifdef ESP32
+    /* WX-01 (upstream #999): UV / wind settings, every ESP32 board, persisted, not exported.
+     * flags bit0 = UV on, bit1 = wind on; pin 0 = off; cal in km/h per Hz. */
+    #define SETTINGS_PERSIST_WX(X)                                                               \
+        X("node_wxflags", CFG_INT, node_wx_flags, 0.0, 3.0,    CFG_NOESC)                        \
+        X("node_windpin", CFG_INT, node_wind_pin, 0.0, 48.0,   CFG_NOESC)                        \
+        X("node_windcal", CFG_FLT, node_wind_cal, 0.1, 100.0,  CFG_NOESC)
     #if defined(BOARD_T_DECK) || defined(BOARD_T_DECK_PLUS) || defined(BOARD_T_DECK_PRO)
         #define SETTINGS_PERSIST_ONLY_LIST_PLATFORM(X)                                           \
+            SETTINGS_PERSIST_WX(X)                                                               \
             X("node_map",      CFG_INT,  node_map,             CFG_NORANGE, CFG_NOESC)          \
             X("node_audstart", CFG_STR,  node_audio_start,     CFG_NORANGE, CFG_NOESC)          \
             X("node_audmsg",   CFG_STR,  node_audio_msg,       CFG_NORANGE, CFG_NOESC)          \
@@ -138,9 +151,15 @@ size_t fieldCount();
             X("node_persd",    CFG_BOOL, node_persist_to_sd,    CFG_NORANGE, CFG_NOESC)          \
             X("node_immsave",  CFG_BOOL, node_immediate_save,   CFG_NORANGE, CFG_NOESC)          \
             X("node_kblsync",  CFG_BOOL, node_kbl_sync,         CFG_NORANGE, CFG_NOESC)          \
-            X("node_wifion",   CFG_BOOL, node_wifion,           CFG_NORANGE, CFG_NOESC)
+            X("node_wifion",   CFG_BOOL, node_wifion,           CFG_NORANGE, CFG_NOESC)          \
+            X("node_blday",    CFG_INT,  node_bl_day,           CFG_NORANGE, CFG_NOESC)          \
+            X("node_blnight",  CFG_INT,  node_bl_night,         CFG_NORANGE, CFG_NOESC)          \
+            X("node_blauto",   CFG_BOOL, node_bl_auto,          CFG_NORANGE, CFG_NOESC)          \
+            X("node_tdtheme",  CFG_CHR,  node_tdeck_theme,      CFG_NORANGE, CFG_NOESC)          \
+            X("node_tdchatf",  CFG_CHR,  node_tdeck_chatfont,   CFG_NORANGE, CFG_NOESC)         \
+            X("node_blfnight", CFG_CHR,  node_bl_fnight,        CFG_NORANGE, CFG_NOESC)
     #else
-        #define SETTINGS_PERSIST_ONLY_LIST_PLATFORM(X)
+        #define SETTINGS_PERSIST_ONLY_LIST_PLATFORM(X) SETTINGS_PERSIST_WX(X)
     #endif
 #else
     #define SETTINGS_PERSIST_ONLY_LIST_PLATFORM(X)

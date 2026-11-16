@@ -30,6 +30,7 @@ def get_target_hardware(asset):
 
     hw_dict = {
     "vision-master-e290.bin": "heltec_e290",
+    "vision-master-e290-otp.bin": "heltec_e290_otp",
     "vision-master-e213.bin": "heltec_e213",
     "esp32-loraprs-e22.bin": "esp32-loraprs-e22",
     "esp32-loraprs-ra01.bin": "esp32-loraprs-ra01",
@@ -65,6 +66,7 @@ def get_target_hardware(asset):
 
     bootloader_dict = {
     "vision-master-e290.bin": "bootloader-s3.bin",
+    "vision-master-e290-otp.bin": "bootloader-s3.bin",
     "vision-master-e213.bin": "bootloader-s3.bin",
     "esp32-loraprs-e22.bin": "bootloader-s3.bin",
     "esp32-loraprs-ra01.bin": "bootloader-s3.bin",
@@ -84,12 +86,12 @@ def get_target_hardware(asset):
     "ttgo_tbeam_SX1268.bin" : "bootloader.bin",
     "ttgo_tbeam_supreme.bin" : "bootloader-s3.bin",
     "T-Beam-1W.bin" : "bootloader-s3.bin",
-    "T3_S3_V13.bin" : "bootloader-s3.bin",
+    "T3_S3_V13.bin" : "bootloader-s3-4.bin",
     "t_connect_pro.bin" : "bootloader-s3.bin",
     "ttgo-lora32-v21.bin" : "bootloader.bin",
     "t_deck.bin" : "bootloader-s3.bin",
     "t_deck_plus.bin" : "bootloader-s3.bin",
-    "t_deck_pro.bin" : "bootloader-s3.bin",
+    "t_deck_pro.bin" : "bootloader-s3-16.bin",
     "wiscore_rak4631.uf2" : "wiscore_rak4631.uf2",
     "wiscore_rak4631.zip" : "wiscore_rak4631.zip",
     "heltec_t114.uf2" : "heltec_t114.uf2",
@@ -100,6 +102,7 @@ def get_target_hardware(asset):
 
     safeboot_dict = {
     "vision-master-e290.bin": "safeboot-s3.bin",
+    "vision-master-e290-otp.bin": "safeboot-s3.bin",
     "vision-master-e213.bin": "safeboot-s3.bin",
     "esp32-loraprs-e22.bin": "safeboot-s3.bin",
     "esp32-loraprs-ra01.bin": "safeboot-s3.bin",

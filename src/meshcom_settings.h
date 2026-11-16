@@ -38,7 +38,7 @@
  * init_flash() seeds most of these again before the walk. Do not "unify"
  * them without reading esp32_flash.cpp's pre-load block first.
  *
- * Platform-specific MEMBERS: the 13 T-Deck UI fields stay T-Deck-only and
+ * Platform-specific MEMBERS: the 16 T-Deck UI fields stay T-Deck-only and
  * node_disp_rot / node_ntp stay ESP32-only (operator decision 2026-09-13,
  * BACKLOG W3 step 4: platform-scoped via CFG_FIELD_LIST_PLATFORM, not inert
  * members on the other platform). Removed for good in the merge:
@@ -102,6 +102,7 @@
     A(char, node_atxt, [40], {0})                                                                        \
     M(int, node_sset2, 0x0000)                                                                           \
     M(int, node_owgpio, MC_PLATFORM_DEFAULT(36, 16))                                                     \
+    M(int, node_dht_type, 11) /* SENS-04: one-wire DHT type, 11 (DHT11) or 22 (DHT22), --dht */          \
     M(float, node_temp2, 0)                                                                              \
     M(float, node_utcoff, MC_PLATFORM_DEFAULT(2, 0))                                                     \
     M(float, node_gas_res, 0) /* BME680 */                                                               \
@@ -196,7 +197,21 @@
     M(int, node_pingcount, 0)                                                                            \
     M(unsigned long, node_pingduration, 0)                                                               \
     /* POSIX TZ string; empty = fixed node_utcoff (TZ-01). Persisted + exported as "node_tz". */          \
-    A(char, node_tz, [40], {0})
+    A(char, node_tz, [40], {0})                                                                          \
+    /* SNF-D7 (#1188): 1 = announce the mailbox calls to the server (STOR); default 0 until approved. Persisted. */ \
+    M(int, node_stor, 0)                                                                                 \
+    /* RM-06 (#1189): 1 = act on authenticated RM1 remote-management DMs (needs node_passwd); default 0. Persisted. */ \
+    M(int, node_rm, 0)                                                                                   \
+    /* BF-01: 1 = RM brute-force protection (per-sender lockout, receiver rate limits, sender policy); default 0 = off. Persisted. */ \
+    M(int, node_rmstrict, 0)                                                                             \
+    /* AU-03 (#1187): firmware auto update, 1 notify / 2 auto (blocked, acts as notify: D14); 0 (off) was removed in D1 and is */ \
+    /* mapped to 1 by sanitize_loaded_settings(). Default notify on ESP32, 0 on nRF52 (no AU there). Persisted; console rung ESP32 only. */ \
+    M(int, node_autoupd, MC_PLATFORM_DEFAULT(1, 0))                                                      \
+    /* AU-03 (#1187): update channel, 0 prod (icssw-org) / 1 dev (DK5EN); default 0. Persisted. */           \
+    M(int, node_updchan, 0)                                                                              \
+    /* gateway registration state (src/gw_reg_runtime.cpp): flag + callsign at entry. Persisted, not exported. */ \
+    M(int, node_gwrf, 0)                                                                                 \
+    A(char, node_gwrc, [10], {0})
 
 /* ESP32-only members (every ESP32 board). */
 #ifdef ESP32
@@ -204,6 +219,10 @@
         /* --rotate 0/90/180/270, additive to the board's base rotation (applyDisplayRotation()); \
          * NVS key "node_disrot" */                                                                  \
         M(int, node_disp_rot, 0)                                                                     \
+        /* WX-01 (upstream #999): bit0 UV on, bit1 wind on; pin 0 = off; cal km/h per Hz (WIND_CAL_DEFAULT) */ \
+        M(int, node_wx_flags, 0)                                                                     \
+        M(int, node_wind_pin, 0)                                                                     \
+        M(float, node_wind_cal, 2.4f)                                                                \
         /* runtime: the NTP host in use, recopied from node_ownntp on every connect */              \
         A(char, node_ntp, [40], {0})
 #else
@@ -230,7 +249,17 @@
         M(bool, node_persist_to_sd, false)                                                           \
         M(bool, node_immediate_save, false)                                                          \
         M(bool, node_kbl_sync, true)                                                                 \
-        M(bool, node_wifion, true)
+        M(bool, node_wifion, true)                                                                   \
+        /* TD-23 backlight: day and night level 1..16 (SYM+B), auto day/night switch */             \
+        M(int, node_bl_day, 16)                                                                      \
+        M(int, node_bl_night, 4)                                                                     \
+        M(bool, node_bl_auto, false)                                                                 \
+        /* TD-THEME-01: 0 auto, 1 dark, 2 light (--theme). Shared block incl. T-Deck Pro (harmless there) */ \
+        M(uint8_t, node_tdeck_theme, 0)                                                              \
+        /* 0 S (12 px), 1 M (14 px), 2 L (16 px) chat body text (--chatfont) */                      \
+        M(uint8_t, node_tdeck_chatfont, 0)                                                           \
+        /* Display mode night: with node_bl_auto off, 1 = fixed night level (0 = day level) */      \
+        M(uint8_t, node_bl_fnight, 0)
 #else
     #define MESHCOM_SETTINGS_MEMBERS_TDECK(M, A)
 #endif

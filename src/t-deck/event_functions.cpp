@@ -15,6 +15,7 @@
 #include "event_functions.h"
 #include "tdeck_extern.h"
 #include "tdeck_helpers.h"
+#include "msg_input_budget.h"   // TD-25
 #include "lv_obj_functions.h"
 #include "lv_obj_functions_extern.h"
 #include <loop_functions.h>
@@ -536,6 +537,10 @@ void btn_event_handler_setup(lv_event_t * e)
             commandAction(cCmd, false);
         }
 
+        // GPS-11: position before the save, for gpsPosFilterManualSet()
+        double oldLat = meshcom_settings.node_lat, oldLon = meshcom_settings.node_lon;
+        char oldLatC = meshcom_settings.node_lat_c, oldLonC = meshcom_settings.node_lon_c;
+
         // LAT
         strVar = lv_textarea_get_text(setup_lat);
         char cNew[15] = {0};
@@ -552,6 +557,7 @@ void btn_event_handler_setup(lv_event_t * e)
 
         strVar = lv_textarea_get_text(setup_lon_c);
         meshcom_settings.node_lon_c = strVar.charAt(0);
+        gpsPosFilterManualSet(oldLat, oldLatC, oldLon, oldLonC);   // GPS-11: resets only on a change
 
         // ALT
         strVar = lv_textarea_get_text(setup_alt);
@@ -726,17 +732,16 @@ void btn_event_handler_send(lv_event_t * e)
         String strText = lv_textarea_get_text(text_input);
         String strDMText = lv_textarea_get_text(dm_callsign);
 
+        // TD-25: clamp the text part on a code-point boundary to the byte budget
+        size_t keep = msg_input_clamp(strText.c_str(), strText.length(), msg_input_budget(strDMText.c_str()));
+        strText = strText.substring(0, keep);
+
         if (strDMText.length() > 0)
             snprintf(message_text, sizeof(message_text), ":{%s}%s", strDMText.c_str(), strText.c_str());
         else
             snprintf(message_text, sizeof(message_text), ":%s", strText.c_str());
 
         int iml = strlen(message_text);
-        if (iml>150)
-        {
-            iml = 150;
-            message_text[iml] = 0x00;
-        }
 
         // BP-01: origin GUI -- a QRS/QRT/QTA/QRV lands in the on-screen
         // message list (addMessage()), the same place a received text goes.
@@ -826,7 +831,7 @@ void btn_event_handler_clear(lv_event_t * e)
             Serial.println("clear Clicked");
 
         lv_textarea_set_text(text_input, (char*)"");
-        lv_textarea_set_text(dm_callsign, (char*)"");
+        tdeck_dm_callsign_set_explicit("");
 
         lv_group_focus_obj(text_input);
     }
@@ -934,6 +939,7 @@ void tabview_event_cb(lv_event_t * e)
             case 0: // MSG
                 break;
             case 1: // SND
+                tdeck_dm_callsign_prefill();
                 lv_group_focus_obj(text_input);
                 break;
             case 2: // POS

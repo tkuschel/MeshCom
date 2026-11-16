@@ -253,6 +253,9 @@ struct NbrEdge
 //   gw_min[r]     Minute (mod 256) des letzten HEY an "HG" von Zeile r; nur
 //                 gelesen, solange NBR_FLAG_GW auf Zeile r > 0 steht (Verfall
 //                 nach NBR_GW_HOLD_MIN im nbrSweep()). NBR_MAX_ROWS Byte.
+//   fw[r]         Firmware-Stand des Absenders von Zeile r (nbrNoteFw()):
+//                 Bit 0-7 msg_source_fw_version (40 = 4.40), Bit 8-12
+//                 Buchstabe 'a'..'z' -> 1..26; 0 = unbekannt. 2 B je Zeile.
 struct NbrMatrix
 {
     uint64_t call[NBR_MAX_ROWS];
@@ -264,6 +267,7 @@ struct NbrMatrix
     uint16_t last_sweep;   // Minute des letzten nbrSweep()
     uint16_t last_halve;   // Minute der letzten Zaehlerhalbierung
     uint16_t echo_min[4];
+    uint16_t fw[NBR_MAX_ROWS];
     uint8_t  echo_type[4];
     uint8_t  hz_meta[NBR_HZ_ENTRIES][4];
     uint8_t  ext[NBR_EXT_SLOTS][13];
@@ -287,6 +291,8 @@ struct NbrRowView
     uint8_t  flags;
     uint8_t  hw;
     uint8_t  ncnt;
+    uint8_t  fw_ver;     // msg_source_fw_version (40 = 4.40), 0 unbekannt
+    char     fw_sub;     // 'a'..'z', 0 unbekannt
 };
 
 struct NbrEdgeView
@@ -560,6 +566,19 @@ void nbrNoteDirect(NbrMatrix &m, const char *last_hop, const NbrDirectInfo &info
 // B2, B4, B5 des NCNT-Papiers entfallen).
 void nbrNoteNcnt(NbrMatrix &m, const char *call, int ncnt, uint16_t now_min);
 
+// Firmware-Stand einer Station (msg_source_fw_version und
+// msg_source_fw_sub_version) in die Zeile ihres Absenders, direkt oder
+// relayt: beide Felder setzt, wer den Rahmen kodiert; Relais und Gateway
+// reichen sie unveraendert durch. Der Aufrufer ruft nur, wenn das FW-Byte im
+// Rahmen stand (msg_source_fw_on_air), sonst traegt das Feld den eigenen
+// Stand. Grenze: ein Rahmen, den ein anderer Knoten im Namen des Absenders
+// neu kodiert (S&F-Zustellung glueDeliver()), traegt dessen Stand, bis der
+// naechste eigene Rahmen des Absenders ihn ueberschreibt. Ohne Zeile
+// folgenlos, Zeile 0 bleibt unberuehrt (der eigene Stand kommt aus dem
+// Build). ver 0 laesst den Eintrag stehen; ein Buchstabe ausserhalb 'a'..'z'
+// (aelterer Absender: '#') wird als unbekannt gespeichert.
+void nbrNoteFw(NbrMatrix &m, const char *call, uint8_t ver, char sub);
+
 // CONTRACT (Welle 3), Echo-Tabelle (Konzept 4.11, Daten fuer Stufe 4): die
 // letzten 4 eigenen POS/HEY-Rahmen mit msg_id. nbrNoteFrame() erkennt deren
 // Echo ("<ich>,X[,Y]") und fuehrt Masken erster (X) und zweiter Hand (Y) sowie
@@ -776,6 +795,18 @@ struct NbrNeed
 // fuer hasf UND alone (siehe nbr_matrix.cpp). msg_id geht nur in die
 // SYM-Log-Zeilen ein, sonst in keine Rechnung.
 NbrNeed nbrRelayNeed(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id);
+
+// nbrServerNeed -- wie nbrRelayNeed, aber fuer einen vom Server eingespeisten
+// Frame (Gateway, "udp_rx"). CONTRACT: path ist der Pfad wie empfangen (nur der
+// Urheber, meist keine Matrixzeile). Zusaetzlich zu HatF aus nbrRelayNeed zaehlt jede
+// Zeile mit gueltigem Gateway-Flag (NBR_GW_HOLD_MIN) als "hat den Frame": andere
+// Gateways bekommen ihn selbst vom Server. NICHT deren Hoerer -- die haben ihn
+// erst, wenn das Gateway gesendet hat (Deckung in nbrCoverMask beim gehoerten
+// Duplikat). need bleibt gleich (GW-Zeilen sind schon aus dep raus); nur allein
+// aendert sich: direkte GW-Zeilen sind Versorger,
+// ein Abhaengiger X mit lebender Kante "X hat G gehoert" ist damit nicht allein.
+// Sonst identisch (known, inferred, sym, msg_id).
+NbrNeed nbrServerNeed(const NbrMatrix &m, const char *path, uint16_t now_min, bool sym, uint32_t msg_id);
 
 // Deckung durch eine gehoerte fremde Wiederholung: die Hoerer des Relayers
 // (nbrHearersMask seiner Zeile) plus, wenn sym, jedes X, fuer das der

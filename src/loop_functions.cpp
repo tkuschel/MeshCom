@@ -117,6 +117,12 @@ int ifalseping = 0;
 int BOARD_HARDWARE = MODUL_HARDWARE;
 bool bUSER_BOARD_LED = false;
 
+// WEB-LED-01: stored mode, off / flash / steady (board_led.h); steady bit = node_sset4 0x4000
+int boardLedModeGet(void)
+{
+    return boardLedMode(bUSER_BOARD_LED, (meshcom_settings.node_sset4 & BOARD_LED_STEADY_BIT) != 0);
+}
+
 // LED-08/09/10 (design 6.1): which LEDs exist on this build/node, the one source for --info, BLE SN/SN1 and the web
 // GUI. Board LED = BOARD_LED pin or a NeoPixel-only heartbeat (LED_PIN with pixels, no BOARD_LED); charge LED =
 // AXP compiled in AND a PMU answered (chargeLedFitted(): false without AXP). ledFitted() of board_led.h decides.
@@ -237,6 +243,16 @@ static void boardLedWhitePulse(void)
             bLED_WEISS = true;   // lit edge only; the NeoPixel handler shows it and clears it again
     }
 }
+
+#if !defined(BOARD_LED)
+// WEB-LED-01: steady re-arm. CLEAR is ignored on purpose: after DELAYVAL the handler sets CLEAR, and a pending WEISS
+// wins over CLEAR there (white again, one show() per second); re-arming only after black would leave a dark gap.
+static void boardLedWhiteRearm(void)
+{
+    if (pixels_delay == 0 && boardLedSteadyRearm(BOARD_LED_MODE_STEADY, bLED_RED, bLED_GREEN, bLED_ORANGE, bLED_BLUE, bLED_CLEAR))
+        bLED_WEISS = true;
+}
+#endif
 #endif
 
 #if defined(BOARD_LED)
@@ -269,7 +285,8 @@ static void boardLedWrite(bool lit)
 
 void boardLedTick(void)
 {
-    if (!bUSER_BOARD_LED || !boardLedPinUsable())
+    const int mode = boardLedModeGet();   // WEB-LED-01: off / flash / steady
+    if (mode == BOARD_LED_MODE_OFF || !boardLedPinUsable())
     {
         if (boardLedLit)   // switched off (or OneWire took the pin) mid-flash: leave dark
         {
@@ -283,11 +300,20 @@ void boardLedTick(void)
         #endif
         return;
     }
-    const BoardLedStep st = boardLedPhase(millis(), boardLedTimer, boardLedLit);
+    // An active RM1 "led" override on the same pad wins until it is released (steady resumes after "led off")
+    bool rmHold = false;
+    #if defined(REMOTE_LED_PIN) && defined(BOARD_LED) && (REMOTE_LED_PIN == BOARD_LED)
+    rmHold = bRemoteLed;
+    #endif
+    const BoardLedStep st = boardLedDecide(mode, true, rmHold, millis(), boardLedTimer, boardLedLit);
     boardLedTimer = st.timer;
     boardLedLit = st.lit;
     if (st.changed)
         boardLedWrite(st.lit);
+    #if !defined(BOARD_LED)
+    if (mode == BOARD_LED_MODE_STEADY)   // NeoPixel-only: the pixel handler clears the white pulse, so re-arm it
+        boardLedWhiteRearm();
+    #endif
 }
 
 void boardLedForceOff(void)   // before deep sleep: LED dark, flasher phase reset
@@ -382,6 +408,7 @@ char LogCallsign[10] = {0};
 
 bool bDisplayRetx = false;
 unsigned long DisplayOffWait = 0;
+unsigned long heldFrameUntilMs = 0;   // PING-HOLD-01: clock-skip deadline of a ping/pong frame (0 = none)
 bool bHeldFrameDrawn = false;   // CLK-PING-01: a held full-screen frame was drawn (DisplayPong, hold text)
 bool bDisplayTrack = false;
 bool bOneButton = false;
@@ -395,6 +422,7 @@ bool bGPSL76K = false;
 bool bBMPON = false;
 bool bBMP3ON = false;
 bool bAHT20ON = false;
+bool bAPRSWX = false;   // MCFW-WX1: APRS-IS weather enabled (mirror of node_aprswx; ESP32 only)
 bool bUVON = false;
 bool bWINDON = false;
 #if defined(ENABLE_LTR390) || defined(ENABLE_WIND)
@@ -2201,9 +2229,18 @@ static void sendDisplayClockLine()
     dcIn.second       = meshcom_settings.node_date_second;
     dcIn.oneButton    = bOneButton;
     dcIn.displayDirty = bDisplayDirty;
-    dcIn.holdActive   = dispClkHeldFrame(DisplayOffWait, bHeldFrameDrawn);   // CLK-PING-01: drawn held frame, no clock line
+    const unsigned long dcNow = millis();   // one read: the expiry edge and the clear must see the same time
+    const bool heldFrameExpired = dispClkFrameExpired(bHeldFrameDrawn, heldFrameUntilMs, dcNow);   // PING-HOLD-02: before the call below clears it
+    (void)heldFrameExpired;   // used only on u8g2 boards (#if below); TFT/e-paper builds would warn -> -Werror
+    dcIn.holdActive   = dispClkHeldFrame(DisplayOffWait, bHeldFrameDrawn, dcNow, heldFrameUntilMs);   // CLK-PING-01: drawn held frame, no clock line
 
     const DispClkDecision dcDecision = dispClkDecide(dcIn);
+    #if !defined (BOARD_T5_EPAPER) && !defined (HAS_TFT) && !defined (HAS_TFT_114) && !defined (HAS_TFT_CONNECT)
+    // PING-HOLD-02: ping/pong frame expired on the message page: no clock line there (F1), but the stale frame
+    // must go; re-transfer the cached page buffer ("#N", pageText[0] untouched) once.
+    if(heldFrameExpired && dcDecision == DispClkDecision::SkipType0 && pageLineAnz > 0)
+        sendDisplay1306(false, true, 0, 0, (char*)"#N");
+    #endif
     if(dcDecision != DispClkDecision::Draw)
         return;
 
@@ -2765,12 +2802,24 @@ void mainStartTimeLoop()
                         wpRefreshClock();
                     }
                     #else
-                    if(DisplayOffWait == 0)
+                    // TRACK-PING-01: a ping/pong/fail frame (DisplayOffWait = node_pingtime) is replaced by the
+                    // track page at its PING_FRAME_HOLD_MS deadline; DisplayOffWait keeps its full length.
+                    if(dispClkTrackMayDraw(DisplayOffWait, bHeldFrameDrawn, heldFrameUntilMs, millis()))
                     {
+                        const bool bPingFrameExpired = (DisplayOffWait != 0);   // released by the deadline, not by DisplayOffWait
+                        if(bPingFrameExpired)
+                            bDisplayDirty = true;   // rebuild the track page now, do not wait for the 15 s grid
+
                         if(iDisplayChange > 10)
                             sendDisplayWX(); // Show WX
                         else
                             sendDisplayTrack(); // Show Track
+
+                        if(bPingFrameExpired && !bSetDisplay)   // a setdisplay text blocked the draw: keep the hold
+                        {
+                            bHeldFrameDrawn  = false;   // frame consumed: the clock line is free again
+                            heldFrameUntilMs = 0;
+                        }
                     }
                     #endif
                 }
@@ -4015,7 +4064,8 @@ void DisplayPong(char line1[20], char line2[20], char line3[20], char line4[20])
             u8g2->drawStr(5, 60, line4);
         #endif
     } while (u8g2->nextPage());
-    bHeldFrameDrawn = true;   // CLK-PING-01: the clock line keeps off this frame while DisplayOffWait runs
+    bHeldFrameDrawn = true;   // CLK-PING-01: the clock line keeps off this frame for PING_FRAME_HOLD_MS
+    heldFrameUntilMs = dispClkFrameDeadline(millis(), dispClkPingHoldMs(meshcom_settings.node_pingtime));
 
     #endif
 }

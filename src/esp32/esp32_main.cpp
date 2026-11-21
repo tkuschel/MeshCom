@@ -37,6 +37,7 @@ SPIClass ethSPI(FSPI);
 #include "esp32_flash.h"
 #include "fw_update.h"       // AU-05 (#1187): update policy (fwTick and friends)
 #include "wifi_start_gate.h" // D15: WiFi start rule for the auto update
+#include "aprs_is_client.h"  // MCFW-WX1: APRS-IS weather
 #include "fw_update_net.h"   // AU-05: CHECK / DOWNLOAD worker (own task)
 #include "rm_au_go.h"        // remote "upd go" state (rm_au_esp32.cpp)
 #include "safeboot/safeboot_ver.h" // AU-12: AU_SAFEBOOT_MIN for the boot demotion
@@ -1046,12 +1047,14 @@ bool is_new_packet(uint8_t compBuffer[4]);     // switch if we have a packet rec
 #include "gateway_service.h"
 #include "gw_reg_runtime.h"
 #include "wx_pins.h"
+#include "pin_board.h"   // GPIO-01
 #ifdef ENABLE_LTR390
 #include "ltr390.h"
 #endif
 #ifdef ENABLE_WIND
 #include "wind_counter.h"
 #endif
+#include "ping_budget.h"   // PING-NRF-01: pingBudgetOpen(), pingCountAfterSend()
 
 bool g_meshcom_initialized;
 bool init_flash_done=false;
@@ -1506,6 +1509,7 @@ void esp32setup()
     bAnalogCheck = meshcom_settings.node_sset3 & 0x0008;
     bBMP3ON = meshcom_settings.node_sset3 & 0x0010;
     bAHT20ON = meshcom_settings.node_sset3 & 0x0020;
+    bAPRSWX = meshcom_settings.node_aprswx != 0;         // MCFW-WX1
     bUVON = meshcom_settings.node_wx_flags & 0x0001;     // WX-01: UV / wind switches
     bWINDON = meshcom_settings.node_wx_flags & 0x0002;
     bAnalogFilter = meshcom_settings.node_sset3 & 0x0040;
@@ -1824,7 +1828,18 @@ void esp32setup()
     #endif
 
     #if defined(ENABLE_WIND)
-        if(bWINDON && meshcom_settings.node_wind_pin != 0 && wxWindPinOk(meshcom_settings.node_wind_pin))
+        // GPIO-01: a stored forbidden pin is repaired (esp32_flash.cpp sanitize_loaded_settings); strapping/claimed
+        // pins of an existing setup keep working, input-only pins have no pull-up for the anemometer
+        {
+            const int wbd = pinBoardDefault(PIN_FN_WIND);   // -1 = none; pinRepairLoaded() wants the 0 sentinel
+            const int wp = pinRepairLoaded(pinBoardContext(PIN_FN_WIND), meshcom_settings.node_wind_pin, wbd < 0 ? 0 : wbd);
+            if(wp != meshcom_settings.node_wind_pin)
+            {
+                Serial.printf("[WIND]...gpio %i forbidden on this board, reset to off\n", meshcom_settings.node_wind_pin);
+                meshcom_settings.node_wind_pin = wp;
+            }
+        }
+        if(bWINDON && pinBoardLoadedUsable(PIN_FN_WIND, meshcom_settings.node_wind_pin))
             windBegin(meshcom_settings.node_wind_pin);
     #endif
 
@@ -2450,7 +2465,7 @@ void esp32setup()
     // WIFI
     // AU-05 (#1187): the firmware auto update needs the STA link on its own, independent of the gateway flag.
     // D15: for AU alone only with an SSID set and not in AP mode (wifi_start_gate.h)
-    if(wifiStartWanted(bGATEWAY, bEXTUDP, bWEBSERVER, bNETCONSOLE, meshcom_settings.node_autoupd, bWIFIAP, meshcom_settings.node_ssid))
+    if(wifiStartWanted(bGATEWAY, bEXTUDP, bWEBSERVER, bNETCONSOLE, meshcom_settings.node_autoupd, bWIFIAP, meshcom_settings.node_ssid, bAPRSWX))
     {
         bAllStarted=false;
 
@@ -3195,7 +3210,9 @@ void esp32loop()
     static bool s_bootReadyLogged = false;
     if (!s_bootReadyLogged)
     {
-        bool network_wanted = bGATEWAY || bEXTUDP || bWEBSERVER || bNETCONSOLE;
+        // MCFW-WX1: aprswx counts only when it may start Wi-Fi on its own (SSID set, not AP), as at boot
+        const bool aprswx_net = wifiAprsWxWantsStart(bAPRSWX, bWIFIAP, meshcom_settings.node_ssid);
+        bool network_wanted = bGATEWAY || bEXTUDP || bWEBSERVER || bNETCONSOLE || aprswx_net;
         // hasIPaddress (global) kippt bei "now listening at IP"; die Kopie in
         // meshcom_settings wird erst spaeter nachgezogen -- beide pruefen.
         extern bool hasIPaddress;
@@ -4902,6 +4919,12 @@ void esp32loop()
         akt_timer = 20 * 1000; // 20 Seconds PARM, UNIT, EQNS and 1st T-Message
     }
         
+    // MCFW-WX1: APRS-IS weather timer + client state machine. Off (default): not a single step is executed.
+    if(bAPRSWX)
+    {
+        aprsWxLoop();
+    }
+
     if (((uint32_t)(millis() - telemetry_timer) >= akt_timer) || (bTeleFirst && bAllStarted))
     {
         bTeleFirst=false;
@@ -5230,7 +5253,9 @@ void esp32loop()
         stopNetConsole();   // no-op unless started
     #endif
 
-    if(bWEBSERVER || bEXTUDP || bGATEWAY || bNETCONSOLE || bKISS)
+    // MCFW-WX1: aprswx enters the service block under the boot rule (wifiAprsWxWantsStart: SSID set, not AP mode),
+    // so "--aprswx on" at runtime never asks startNetwork() for a STA link it cannot have (review finding 3).
+    if(bWEBSERVER || bEXTUDP || bGATEWAY || bNETCONSOLE || bKISS || wifiAprsWxWantsStart(bAPRSWX, bWIFIAP, meshcom_settings.node_ssid))
     {
         if (web_timer == 0 || (iWlanWait > 0 && ((uint32_t)(millis() - web_timer) >= 1000)) || ((uint32_t)(millis() - web_timer) >= (HEARTBEAT_INTERVAL * 1000 * 10)))   // repeat 5 minutes
         {
@@ -5325,7 +5350,23 @@ void esp32loop()
     if (resendPing == 0)
         resendPing = millis();
 
-    if(meshcom_settings.node_pingtime > 29 && meshcom_settings.node_pingcall[0] != 0x00 && meshcom_settings.node_pingcount > 0)
+    // LAST-PONG-01: armed after the last send; one more check tick gives it its fail verdict.
+    static bool pingFinalArmed = false;
+    const bool pingBudgetIsOpen = pingBudgetOpen(meshcom_settings.node_pingtime, meshcom_settings.node_pingcall, meshcom_settings.node_pingcount);
+
+    if(pingFailCheckDue(pingFinalArmed, pingBudgetIsOpen, (int32_t)(millis() - (resendPing + meshcom_settings.node_pingtime * 1000)) > 0))
+    {
+        pingFinalArmed = false;
+        // A target cleared since the last send (--pingcall none) gets no verdict.
+        if(bPingSend && meshcom_settings.node_pingcall[0] != 0x00)
+        {
+            printfdeb("[PONG]...fail from %s\n", meshcom_settings.node_pingcall);
+            PongFail(meshcom_settings.node_pingcall);
+        }
+        bPingSend = false;
+    }
+
+    if(pingBudgetIsOpen)
     {
         if((int32_t)(millis() - (resendPing + meshcom_settings.node_pingtime * 1000)) > 0)
         {
@@ -5339,6 +5380,13 @@ void esp32loop()
 
             PingResult pingResult = sendPing(meshcom_settings.node_pingcall);
 
+            // PING-FAIL-REPEAT-01: no new ping queued (refused ring, TRACK, invalid target): drop the
+            // stale flag so the unanswered ping is not reported again on the next tick. Cleared after
+            // sendPing(), not before: sendPing() draws "SENT" only while !bPingSend, and the
+            // "PONG FAILED" frame drawn just above must stay on the OLED.
+            if(pingResult != PING_QUEUED)
+                bPingSend = false;
+
             // PING_INVALID_TARGET logs its own once-per-episode notice in sendPing().
             if(pingResult != PING_INVALID_TARGET)
                 printfdeb("[PING]...%s Ping to %s <%i>\n", (pingResult == PING_QUEUED) ? "send" : "FAILED", meshcom_settings.node_pingcall, meshcom_settings.node_pingcount);
@@ -5348,8 +5396,9 @@ void esp32loop()
             // und der Knoten verstummt dauerhaft -- wirkt dann wie ein Einstellungsfehler.
             // Ein abgelehnter Ring ist dagegen ein echter Sendeversuch und zählt mit.
             // PING_INVALID_TARGET is no send attempt either.
-            if(pingResult != PING_SUPPRESSED_TRACK && pingResult != PING_INVALID_TARGET)
-                meshcom_settings.node_pingcount--;
+            const int pingCountBefore = meshcom_settings.node_pingcount;
+            meshcom_settings.node_pingcount = pingCountAfterSend(meshcom_settings.node_pingcount, pingResult == PING_SUPPRESSED_TRACK, pingResult == PING_INVALID_TARGET);
+            pingFinalArmed = pingFinalArmAfterSend(pingCountBefore, meshcom_settings.node_pingcount, pingResult == PING_QUEUED);
         }
     }
 
